@@ -1,0 +1,23 @@
+# 機密（絕對不上傳）
+.env
+
+# 虛擬環境
+venv/
+
+# Python 暫存
+__pycache__/
+*.pyc
+*.pyo
+
+# 資料庫與歷史資料（檔案太大）
+data/
+*.db
+*.sqlite
+
+# AI 記憶與日誌
+memory/*.json
+memory/chat_history/
+
+# 系統檔案
+.DS_Store
+Thumbs.db
