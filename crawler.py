@@ -7,11 +7,9 @@ database/crawler.py - 歷史資料爬蟲
   - 股票清單：證交所 + 櫃買中心
 """
 import time
-import random
 import logging
 import pandas as pd
 from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
 from database.db_manager import (
     get_conn, safe_request, CRAWL_CONFIG,
     get_crawl_progress, update_crawl_progress, log_crawl,
@@ -24,62 +22,62 @@ logger = logging.getLogger(__name__)
 
 def fetch_stock_list() -> list:
     """
-    從證交所取得所有上市櫃股票清單
-    使用 BeautifulSoup 解析 HTML（比 pd.read_html 更穩定）
+    從證交所取得所有上市股票清單
     """
     stocks = []
 
-    targets = [
-        ("https://isin.twse.com.tw/isin/C_public.jsp", {"strMode": "2"}, "TWSE"),
-        ("https://isin.twse.com.tw/isin/C_public.jsp", {"strMode": "4"}, "OTC"),
-    ]
+    # 上市（TWSE）
+    url = "https://isin.twse.com.tw/isin/C_public.jsp"
+    params = {"strMode": "2"}
+    resp = safe_request(url, params)
 
-    for url, params, market in targets:
-        resp = safe_request(url, params)
-        if not resp:
-            logger.error(f"無法連線取得 {market} 清單")
-            continue
+    if resp:
         try:
             resp.encoding = "big5"
-            soup = BeautifulSoup(resp.text, "html.parser")
-            rows = soup.find_all("tr")
-            count = 0
-            for row in rows:
-                cells = row.find_all("td")
-                if len(cells) < 2:
-                    continue
-                cell_text = cells[0].get_text(strip=True)
-                # 格式：「2330　台積電」（全形空格分隔）
-                if len(cell_text) < 5:
-                    continue
-                # 前4碼必須是數字
-                code = cell_text[:4]
-                if not code.isdigit():
-                    continue
-                # 取名稱（去除全形空格）
-                name_part = cell_text[4:].strip().lstrip("\u3000").strip()
-                if not name_part:
-                    continue
-                stocks.append({
-                    "stock_id": code,
-                    "name": name_part,
-                    "market": market,
-                })
-                count += 1
-            logger.info(f"{market} 解析完成：{count} 支")
+            tables = pd.read_html(resp.text)
+            df = tables[0]
+            df.columns = df.iloc[0]
+            df = df.iloc[1:]
+            for _, row in df.iterrows():
+                code_name = str(row.iloc[0])
+                if len(code_name) > 4 and code_name[:4].isdigit():
+                    parts = code_name.split("\u3000")
+                    if len(parts) >= 2:
+                        stocks.append({
+                            "stock_id": parts[0].strip(),
+                            "name": parts[1].strip(),
+                            "market": "TWSE",
+                        })
         except Exception as e:
-            logger.error(f"解析 {market} 清單失敗: {e}")
+            logger.error(f"解析上市清單失敗: {e}")
 
-    # 去除重複代號
-    seen = set()
-    unique = []
-    for s in stocks:
-        if s["stock_id"] not in seen:
-            seen.add(s["stock_id"])
-            unique.append(s)
+    # 上櫃（OTC）
+    url2 = "https://isin.twse.com.tw/isin/C_public.jsp"
+    params2 = {"strMode": "4"}
+    resp2 = safe_request(url2, params2)
 
-    logger.info(f"✅ 取得股票清單：共 {len(unique)} 支")
-    return unique
+    if resp2:
+        try:
+            resp2.encoding = "big5"
+            tables2 = pd.read_html(resp2.text)
+            df2 = tables2[0]
+            df2.columns = df2.iloc[0]
+            df2 = df2.iloc[1:]
+            for _, row in df2.iterrows():
+                code_name = str(row.iloc[0])
+                if len(code_name) > 4 and code_name[:4].isdigit():
+                    parts = code_name.split("\u3000")
+                    if len(parts) >= 2:
+                        stocks.append({
+                            "stock_id": parts[0].strip(),
+                            "name": parts[1].strip(),
+                            "market": "OTC",
+                        })
+        except Exception as e:
+            logger.error(f"解析上櫃清單失敗: {e}")
+
+    logger.info(f"✅ 取得股票清單：共 {len(stocks)} 支")
+    return stocks
 
 
 def save_stock_list(stocks: list):
@@ -115,7 +113,7 @@ def fetch_price_yfinance(stock_id: str, start: str, end: str) -> pd.DataFrame:
                 df.columns = [c.lower() for c in df.columns]
                 df["stock_id"] = stock_id
                 df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-                df["adj_close"] = df["close"]
+                df["adj_close"] = df["close"]  # yfinance 已自動還原
                 df = df[["stock_id", "date", "open", "high", "low", "close", "volume", "adj_close"]]
                 df = df.dropna(subset=["close"])
                 return df
@@ -168,6 +166,7 @@ def crawl_all_prices(start_year: int = 2015, stock_ids: list = None):
         logger.warning("股票清單為空，請先執行 fetch_stock_list()")
         return
 
+    # 斷點續爬
     last_done = get_crawl_progress("price_crawl") or ""
     total = len(stock_ids)
     done = 0
@@ -180,6 +179,7 @@ def crawl_all_prices(start_year: int = 2015, stock_ids: list = None):
         logger.info(f"斷點續爬：從 {last_done} 之後繼續")
 
     for i, stock_id in enumerate(stock_ids):
+        # 跳過已爬完的
         if last_done and stock_id <= last_done:
             continue
 
@@ -191,12 +191,14 @@ def crawl_all_prices(start_year: int = 2015, stock_ids: list = None):
             if done % 10 == 0:
                 logger.info(f"進度：{i+1}/{total} | 已存 {count} 筆 | {stock_id}")
 
+            # 批次暫停（每 20 支暫停一下，降低被封機率）
             if done % CRAWL_CONFIG["batch_size"] == 0:
-                logger.info(f"批次暫停 {CRAWL_CONFIG['batch_pause']} 秒...")
+                logger.info(f"⏸️  批次暫停 {CRAWL_CONFIG['batch_pause']} 秒...")
                 time.sleep(CRAWL_CONFIG["batch_pause"])
             else:
                 time.sleep(random.uniform(0.5, 1.5))
 
+            # 儲存斷點
             update_crawl_progress("price_crawl", stock_id, "running")
 
         except Exception as e:
@@ -210,7 +212,10 @@ def crawl_all_prices(start_year: int = 2015, stock_ids: list = None):
 # ── 三大法人籌碼爬蟲 ──────────────────────────────
 
 def crawl_institutional(start_date: str = None, end_date: str = None):
-    """爬取三大法人歷史資料"""
+    """
+    爬取三大法人歷史資料
+    每次只能抓一天，需逐日爬取
+    """
     if not end_date:
         end_date = datetime.now().strftime("%Y-%m-%d")
     if not start_date:
@@ -225,13 +230,18 @@ def crawl_institutional(start_date: str = None, end_date: str = None):
     logger.info(f"開始爬取三大法人籌碼 | {start_date} ~ {end_date}")
 
     while current <= end:
+        # 跳過週末
         if current.weekday() >= 5:
             current += timedelta(days=1)
             continue
 
         date_str = current.strftime("%Y%m%d")
         url = "https://www.twse.com.tw/fund/T86"
-        params = {"response": "json", "date": date_str, "selectType": "ALLBUT0999"}
+        params = {
+            "response": "json",
+            "date": date_str,
+            "selectType": "ALLBUT0999",
+        }
 
         resp = safe_request(url, params)
         if resp:
@@ -255,8 +265,10 @@ def crawl_institutional(start_date: str = None, end_date: str = None):
                         foreign_net = parse_int(row[4])
                         trust_net = parse_int(row[10])
                         dealer_net = parse_int(row[14])
+
                         rows.append((
-                            stock_id, current.strftime("%Y-%m-%d"),
+                            stock_id,
+                            current.strftime("%Y-%m-%d"),
                             foreign_net, trust_net, dealer_net,
                             foreign_net + trust_net + dealer_net,
                         ))
@@ -276,7 +288,7 @@ def crawl_institutional(start_date: str = None, end_date: str = None):
                     done += 1
                     if done % 20 == 0:
                         pct = done / max(total_days, 1) * 100
-                        logger.info(f"籌碼進度：{done} 天 ({pct:.1f}%) | {current.strftime('%Y-%m-%d')}")
+                        logger.info(f"籌碼爬取進度：{done} 天 ({pct:.1f}%) | {current.strftime('%Y-%m-%d')}")
 
                     update_crawl_progress("institutional_crawl", current.strftime("%Y-%m-%d"))
 
@@ -292,11 +304,13 @@ def crawl_institutional(start_date: str = None, end_date: str = None):
 # ── 宏觀指標爬蟲 ──────────────────────────────────
 
 def crawl_macro(days: int = 365):
-    """爬取 VIX 歷史資料"""
+    """爬取宏觀指標歷史資料"""
     try:
         import yfinance as yf
         end = datetime.now()
         start = end - timedelta(days=days)
+
+        # VIX
         vix_df = yf.download("^VIX", start=start, end=end, progress=False)
 
         if not vix_df.empty:
@@ -310,22 +324,129 @@ def crawl_macro(days: int = 365):
                         VALUES (?, ?)
                         ON CONFLICT(date) DO UPDATE SET vix = excluded.vix
                     """, (date_str, close))
+
             logger.info(f"✅ VIX 歷史資料儲存完成：{len(vix_df)} 筆")
 
     except Exception as e:
         logger.error(f"宏觀指標爬取失敗: {e}")
 
 
+import random  # 補充 import
+
+
+def crawl_monthly_revenue(months: int = 12):
+    """
+    爬取月營收資料（證交所公開資訊觀測站）
+    每月 10 日前後更新上月營收
+    """
+    import requests
+    from datetime import datetime
+
+    now = datetime.now()
+    success = 0
+
+    for i in range(months):
+        # 計算目標年月
+        month = now.month - i
+        year = now.year
+        while month <= 0:
+            month += 12
+            year -= 1
+
+        # 台股民國年
+        roc_year = year - 1911
+
+        url = "https://mops.twse.com.tw/mops/web/ajax_t05st10_ifrs"
+        payload = {
+            "encodeURIComponent": "1",
+            "step": "1",
+            "firstin": "1",
+            "off": "1",
+            "TYPEK": "sii",
+            "year": str(roc_year),
+            "month": str(month).zfill(2),
+        }
+
+        try:
+            resp = requests.post(url, data=payload,
+                                 headers={"User-Agent": "Mozilla/5.0"},
+                                 timeout=30)
+            resp.encoding = "utf-8"
+
+            import pandas as pd
+            tables = pd.read_html(resp.text)
+            if not tables:
+                continue
+
+            df = tables[0]
+            # 拍平多層欄位
+            if hasattr(df.columns, "levels"):
+                df.columns = [" ".join(str(c) for c in col if "Unnamed" not in str(c)).strip()
+                               for col in df.columns]
+
+            rows_saved = 0
+            with get_conn() as conn:
+                for _, row in df.iterrows():
+                    try:
+                        row_vals = [str(v) for v in row.values]
+                        if len(row_vals) < 4:
+                            continue
+                        stock_id = str(row_vals[0]).strip().replace(" ", "")
+                        if not stock_id[:4].isdigit():
+                            continue
+
+                        def to_float(v):
+                            try:
+                                return float(str(v).replace(",", "").replace(" ", ""))
+                            except:
+                                return 0.0
+
+                        revenue = to_float(row_vals[2])
+                        yoy = to_float(row_vals[6]) if len(row_vals) > 6 else 0.0
+                        mom = to_float(row_vals[5]) if len(row_vals) > 5 else 0.0
+
+                        if revenue <= 0:
+                            continue
+
+                        conn.execute("""
+                            INSERT INTO monthly_revenue
+                                (stock_id, year, month, revenue, yoy, mom, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                            ON CONFLICT(stock_id, year, month) DO UPDATE SET
+                                revenue=excluded.revenue,
+                                yoy=excluded.yoy,
+                                mom=excluded.mom
+                        """, (stock_id, year, month, revenue, yoy, mom))
+                        rows_saved += 1
+                    except Exception:
+                        continue
+
+            success += 1
+            logger.info(f"月營收 {year}/{month:02d} 儲存 {rows_saved} 筆")
+
+        except Exception as e:
+            logger.error(f"月營收爬取失敗 {year}/{month}: {e}")
+
+    logger.info(f"✅ 月營收爬取完成，共處理 {success} 個月")
+
+
 if __name__ == "__main__":
     from database.db_manager import init_db
     init_db()
+
     print("1. 更新股票清單...")
     stocks = fetch_stock_list()
     save_stock_list(stocks)
+
     print("2. 爬取近 1 年股價（測試用）...")
-    crawl_all_prices(start_year=2024, stock_ids=["2330", "2317", "2454", "2382", "2308"])
+    test_stocks = ["2330", "2317", "2454", "2382", "2308"]
+    crawl_all_prices(start_year=2024, stock_ids=test_stocks)
+
     print("3. 爬取近 6 個月籌碼...")
-    crawl_institutional(start_date=(datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d"))
+    start = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+    crawl_institutional(start_date=start)
+
     print("4. 爬取 VIX 歷史...")
     crawl_macro(days=365)
+
     print("完成！")

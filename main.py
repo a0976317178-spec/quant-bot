@@ -15,7 +15,14 @@ from config import TELEGRAM_TOKEN, ALLOWED_USER_IDS, ANTHROPIC_API_KEY, CLAUDE_F
 from memory.rules_manager import add_rule, delete_rule, list_rules, load_history, save_history, clear_history, get_rules_as_prompt
 from memory.daily_learning import add_to_watchlist, remove_from_watchlist, list_watchlist, get_recent_learnings, daily_learning_task
 from portfolio.tracker import add_position, remove_position, list_portfolio, check_portfolio_alerts
+from daily_report import (
+    calc_total_score, format_score_report,
+    add_journal_entry, get_journal_summary,
+    generate_daily_report,
+)
 from risk.manager import get_risk_summary, check_market_risk, calc_position_size, update_risk_param
+from report.daily_report import generate_daily_report, score_stock
+from database.daily_update import run_daily_update
 
 load_dotenv()
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -179,8 +186,158 @@ async def cmd_fenxi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         reply = await ask_claude(update.effective_user.id, message, use_smart=True)
         await update.message.reply_text(reply)
+
+        # 自動附上評分卡
+        try:
+            score = calc_total_score(stock_id, quote.get("name", ""))
+            await update.message.reply_text(format_score_report(score))
+        except Exception as se:
+            logger.debug(f"評分卡失敗: {se}")
+
     except Exception as e:
         await update.message.reply_text(f"分析失敗：{str(e)}")
+
+
+async def cmd_pingfen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """綜合評分：評分 2330"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    parts = text.split()
+    args = [p for p in parts if p not in ["評分", "score", "/score"]]
+    if not args:
+        await update.message.reply_text("請輸入股票代號，例如：評分 2330")
+        return
+    stock_id = args[0]
+    await update.message.reply_text(f"計算 {stock_id} 綜合評分中...")
+    def run():
+        result = calc_score(stock_id)
+        # 取得股票名稱
+        name = ""
+        try:
+            from database.db_manager import get_conn
+            with get_conn() as conn:
+                row = conn.execute("SELECT name FROM stocks WHERE stock_id=?", (stock_id,)).fetchone()
+                if row: name = row["name"]
+        except: pass
+        return format_score_report(result, name)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        report = ex.submit(run).result(timeout=60)
+    await update.message.reply_text(report)
+
+
+async def cmd_riji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看交易日誌"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(format_journal(10))
+
+
+async def cmd_jixiao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看績效統計"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p.isdigit()]
+    days = int(args[0]) if args else 30
+    await update.message.reply_text(format_stats(days))
+
+
+async def cmd_zhoubao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """手動觸發週報"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("生成週報中...")
+    report = await generate_weekly_report()
+    await update.message.reply_text(report)
+
+
+async def cmd_pingfen(update, context):
+    """個股評分：評分 2330"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    parts = text.split()
+    args = [p for p in parts if p not in ["評分", "score", "/score"]]
+    if not args:
+        await update.message.reply_text("請輸入股票代號，例如：評分 2330")
+        return
+    stock_id = args[0]
+    await update.message.reply_text(f"計算 {stock_id} 綜合評分中，請稍候...")
+    import concurrent.futures
+    def run():
+        result = calc_total_score(stock_id)
+        return format_score_report(result)
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        report = ex.submit(run).result(timeout=60)
+    await update.message.reply_text(report)
+
+
+async def cmd_zhoubao(update, context):
+    """查看週報"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("產生交易週報中...")
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        report = ex.submit(format_weekly_report).result(timeout=30)
+    await update.message.reply_text(report)
+
+
+async def cmd_jiaoyijilu(update, context):
+    """查看交易記錄"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(get_recent_trades(10))
+
+
+async def cmd_pingfen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """個股綜合評分：評分 2330"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    parts = text.split()
+    args = [p for p in parts if p not in ["評分", "score", "打分"]]
+    if not args:
+        await update.message.reply_text("請輸入股票代號，例如：評分 2330")
+        return
+    stock_id = args[0]
+    await update.message.reply_text(f"計算 {stock_id} 綜合評分中（約10秒）...")
+    def run():
+        env = score_market_env()
+        result = calc_total_score(stock_id, market_env=env)
+        return format_score_report(result)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        report = executor.submit(run).result(timeout=60)
+    await update.message.reply_text(report)
+
+
+async def cmd_jiaoyijilu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看交易記錄"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(format_trade_history(limit=10))
+
+
+async def cmd_jiaoyitongji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """交易統計"""
+    if not is_authorized(update.effective_user.id): return
+    s30 = get_trade_stats(days=30)
+    s7 = get_trade_stats(days=7)
+    lines = [
+        "交易統計",
+        "",
+        f"本週（7天）",
+        f"交易：{s7['total']}次 | 勝率：{s7['win_rate']}%",
+        f"損益：${s7['total_pnl']:+,.0f}",
+        f"均獲利：{s7['avg_win']:+.2f}% | 均虧損：{s7['avg_loss']:.2f}%",
+        "",
+        f"本月（30天）",
+        f"交易：{s30['total']}次 | 勝率：{s30['win_rate']}%",
+        f"損益：${s30['total_pnl']:+,.0f}",
+        f"均獲利：{s30['avg_win']:+.2f}% | 均虧損：{s30['avg_loss']:.2f}%",
+    ]
+    msg = "\n".join(lines)
+    if s30.get("best"):
+        b = s30["best"]
+        msg += f"\n\n最佳：{b['stock_id']} {b.get('pnl_pct',0):+.2f}%"
+    if s30.get("worst"):
+        w = s30["worst"]
+        msg += f"\n最差：{w['stock_id']} {w.get('pnl_pct',0):+.2f}%"
+    await update.message.reply_text(msg)
 
 
 async def cmd_xuangu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -273,7 +430,31 @@ async def cmd_maijin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif p.startswith("停利"):
                 target_pct = float(p.replace("停利", "")) / 100
         result = add_position(stock_id, entry_price, shares, stop_loss_pct, target_pct)
+        # 自動寫入交易日誌
+        reason = " ".join(args[3:]) if len(args) > 3 else "手動進場"
+        log_entry(stock_id, entry_price, shares, reason=reason)
         await update.message.reply_text(result)
+
+        # 自動評分 + 記錄日誌
+        try:
+            score = calc_total_score(stock_id)
+            journal_msg = record_entry(
+                stock_id=stock_id, stock_name="",
+                entry_price=entry_price, shares=shares,
+                score_result=score,
+                reason=f"手動進場",
+                market_state="盤中"
+            )
+            score_msg = format_score_report(score)
+            await update.message.reply_text(score_msg)
+            if score["total_score"] < 60:
+                await update.message.reply_text(
+                    f"⚠️ 注意：此股評分 {score['total_score']} 分，未達60分標準\n"
+                    f"已記錄為「未達標進場」，將納入勝率分析"
+                )
+        except Exception as je:
+            logger.debug(f"日誌記錄失敗: {je}")
+
     except Exception as e:
         await update.message.reply_text(f"格式錯誤：{e}\n範例：買進 2330 1 980")
 
@@ -288,7 +469,14 @@ async def cmd_machu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     stock_id = args[0]
     exit_price = float(args[1]) if len(args) > 1 else None
-    await update.message.reply_text(remove_position(stock_id, exit_price))
+    result = remove_position(stock_id, exit_price)
+    await update.message.reply_text(result)
+    if exit_price:
+        try:
+            journal_msg = record_exit(stock_id, exit_price, "手動出場")
+            await update.message.reply_text(journal_msg)
+        except Exception as e:
+            logger.debug(f"出場日誌失敗: {e}")
 
 
 async def cmd_chicang(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -326,6 +514,101 @@ async def cmd_jianyi_zhangshui(update: Update, context: ContextTypes.DEFAULT_TYP
         f"目標價：${r['take_profit_price']}\n\n"
         f"以上依據您的風控設定計算"
     )
+
+
+async def cmd_pingfen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """個股綜合評分：評分 2330"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    parts = text.split()
+    args = [p for p in parts if p not in ["評分", "score", "/score"]]
+    if not args:
+        await update.message.reply_text("請輸入股票代號，例如：評分 2330")
+        return
+    stock_id = args[0]
+    await update.message.reply_text(f"計算 {stock_id} 評分中...")
+    def run():
+        result = calc_total_score(stock_id)
+        return format_score_report(result)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        report = executor.submit(run).result(timeout=30)
+    await update.message.reply_text(report)
+
+
+async def cmd_rijibao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """立即產生今日報告"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("產生今日報告中，請稍候...")
+    report = await generate_daily_report()
+    await update.message.reply_text(report)
+
+
+async def cmd_jilu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """記錄交易日誌：記錄 買進 2330 980 外資連買5天"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    parts = text.split()
+    args = [p for p in parts if p not in ["記錄", "/jilu"]]
+    if len(args) < 3:
+        await update.message.reply_text(
+            "格式：記錄 <動作> <代號> <價格> <原因>\n\n"
+            "範例：\n"
+            "記錄 買進 2330 980 外資連買5天站上季線\n"
+            "記錄 賣出 2330 1020 觸及目標價出場\n"
+            "記錄 觀察 2454 250 等待突破前高"
+        )
+        return
+    action = args[0]
+    stock_id = args[1]
+    try:
+        price = float(args[2])
+        reason = " ".join(args[3:]) if len(args) > 3 else "未填原因"
+        result = calc_total_score(stock_id)
+        msg = add_journal_entry(stock_id, action, price, reason, result["score"])
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"格式錯誤：{e}")
+
+
+async def cmd_jilu_tongji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看交易統計"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(get_journal_summary(days=30))
+
+
+async def cmd_daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("生成每日報告中，請稍候...")
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        report = executor.submit(generate_daily_report).result(timeout=120)
+    await update.message.reply_text(report)
+
+
+async def cmd_score_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """對單一股票評分：評分 2330"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    parts = text.split()
+    args = [p for p in parts if p not in ["評分", "score", "/score"]]
+    if not args:
+        await update.message.reply_text("格式：評分 <代號>\n範例：評分 2330")
+        return
+    stock_id = args[0]
+    await update.message.reply_text(f"評分 {stock_id} 中...")
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        result = executor.submit(score_stock, stock_id).result(timeout=60)
+    msg = (
+        f"📊 {result['stock_id']} {result['name']} 綜合評分\n\n"
+        f"總分：{result['score']} 分　{result['grade']}\n"
+        f"━━━━━━━━━━━━━━\n"
+    )
+    for d in result["details"]:
+        msg += f"{d}\n"
+    if result["score"] >= 60:
+        msg += f"\n✅ 建議輸入「分析 {stock_id}」取得完整分析"
+    await update.message.reply_text(msg)
 
 
 async def cmd_fengkong(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -409,6 +692,37 @@ async def cmd_huice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(report)
 
 
+async def cmd_pingfen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """評分卡：評分 2330"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    parts = text.split()
+    args = [p for p in parts if p not in ["評分", "score", "/score"]]
+    if not args:
+        await update.message.reply_text("請輸入股票代號，例如：評分 2330")
+        return
+    stock_id = args[0]
+    await update.message.reply_text(f"計算 {stock_id} 評分中...")
+    import concurrent.futures
+    def run():
+        return calc_total_score(stock_id)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        result = executor.submit(run).result(timeout=60)
+    await update.message.reply_text(format_score_report(result))
+
+
+async def cmd_riji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看交易日誌"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(get_journal_summary())
+
+
+async def cmd_zhoubao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """週報"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(generate_weekly_report())
+
+
 async def cmd_xinzeng_guize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id): return
     if not context.args:
@@ -438,6 +752,73 @@ async def cmd_xuexi_jilu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_xunlian(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id): return
     await update.message.reply_text("開始重新訓練 ML 模型，完成後會通知您...")
+
+
+async def cmd_pingfen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """個股評分：評分 2330"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    parts = text.split()
+    args = [p for p in parts if p not in ["評分", "score", "/score"]]
+    if not args:
+        await update.message.reply_text("請輸入股票代號，例如：評分 2330")
+        return
+    await update.message.reply_text(f"計算 {args[0]} 綜合評分中...")
+    result = get_score_for_stock(args[0])
+    await update.message.reply_text(result)
+
+
+async def cmd_jixiao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看交易績效"""
+    if not is_authorized(update.effective_user.id): return
+    perf = calc_win_rate(days=30)
+    if perf["total"] == 0:
+        await update.message.reply_text(
+            "近30天尚無交易記錄\n\n"
+            "使用「買進 2330 1 980」記錄進場\n"
+            "使用「賣出 2330 1020」記錄出場"
+        )
+        return
+    emoji = "🟢" if perf["win_rate"] >= 50 else "🔴"
+    await update.message.reply_text(
+        f"📈 近30天交易績效\n\n"
+        f"總交易：{perf['total']} 次\n"
+        f"勝率：{emoji} {perf['win_rate']}% ({perf['wins']}勝/{perf['losses']}敗)\n"
+        f"平均損益：{perf['avg_pnl']:+.2f}%"
+    )
+    if perf["total"] == 0:
+        await update.message.reply_text(
+            "近30天尚無交易記錄\n\n"
+            "使用「買進 2330 1 980」記錄進場\n"
+            "使用「賣出 2330 1020」記錄出場"
+        )
+        return
+    emoji = "🟢" if perf["win_rate"] >= 50 else "🔴"
+    await update.message.reply_text(
+        f"📈 近30天交易績效\n\n"
+        f"總交易：{perf['total']} 次\n"
+        f"勝率：{emoji} {perf['win_rate']}% ({perf['wins']}勝/{perf['losses']}敗)\n"
+        f"平均損益：{perf['avg_pnl']:+.2f}%"
+    )
+
+
+async def cmd_yingye(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """爬取月營收"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("開始爬取近12個月月營收，背景執行中...")
+    def run():
+        from database.crawler import crawl_monthly_revenue
+        crawl_monthly_revenue(months=12)
+    import threading
+    threading.Thread(target=run, daemon=True).start()
+
+
+async def cmd_update_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """手動觸發每日更新"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("開始更新所有資料，約需 2~5 分鐘...")
+    result = await run_daily_update()
+    await update.message.reply_text(result)
 
 
 async def cmd_shujuku(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -558,6 +939,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else: await update.message.reply_text("請輸入規則編號，例如：刪除規則 1")
     elif keyword in ["學習記錄", "學習", "learning"]:
         await cmd_xuexi_jilu(update, context)
+    elif keyword in ["更新資料", "立即更新", "update"]:
+        await cmd_update_now(update, context)
     elif keyword in ["資料庫", "資料庫狀態", "db"]:
         await cmd_shujuku(update, context)
     elif keyword in ["初始化", "初始化資料庫"]:
@@ -581,14 +964,62 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_jiancha(update, context)
     elif keyword in ["建倉試算", "試算", "calc"]:
         await cmd_jianyi_zhangshui(update, context)
+    elif keyword in ["每日報告", "今日報告", "report", "推報"]:
+        await cmd_daily_report(update, context)
+    elif keyword in ["評分", "score"]:
+        await cmd_score_stock(update, context)
     elif keyword in ["風控", "risk", "風險設定"]:
         await cmd_fengkong(update, context)
     elif keyword in ["風控設定"]:
         await cmd_fengkong_shezhi(update, context)
     elif keyword in ["市場風險", "風險檢查", "mktcheck"]:
         await cmd_shichang_fengxian(update, context)
+    elif keyword in ["評分", "score", "打分"]:
+        if arg:
+            context.args = [arg]
+            await cmd_pingfen(update, context)
+        else:
+            await update.message.reply_text("請輸入股票代號，例如：評分 2330")
+    elif keyword in ["日誌", "交易日誌", "journal"]:
+        await cmd_riji(update, context)
+    elif keyword in ["績效", "stats", "我的績效"]:
+        await cmd_jixiao(update, context)
+    elif keyword in ["週報", "weekly", "週績效"]:
+        await cmd_zhoubao(update, context)
+    elif keyword in ["評分", "score", "打分"]:
+        await cmd_pingfen(update, context)
+    elif keyword in ["交易記錄", "交易歷史", "買賣記錄"]:
+        await cmd_jiaoyijilu(update, context)
+    elif keyword in ["交易統計", "績效", "勝率"]:
+        await cmd_jiaoyitongji(update, context)
+    elif keyword in ["評分", "score", "打分"]:
+        await cmd_pingfen(update, context)
+    elif keyword in ["今日報告", "日報", "報告"]:
+        await cmd_rijibao(update, context)
+    elif keyword in ["記錄"]:
+        await cmd_jilu(update, context)
+    elif keyword in ["交易統計", "統計", "勝率"]:
+        await cmd_jilu_tongji(update, context)
     elif keyword in ["回測", "backtest", "歷史回測"]:
         await cmd_huice(update, context)
+    elif keyword in ["評分", "score", "打分", "分析評分"]:
+        await cmd_pingfen(update, context)
+    elif keyword in ["週報", "周報", "交易週報"]:
+        await cmd_zhoubao(update, context)
+    elif keyword in ["交易記錄", "日誌", "記錄"]:
+        await cmd_jiaoyijilu(update, context)
+    elif keyword in ["評分", "score", "打分"]:
+        await cmd_pingfen(update, context)
+    elif keyword in ["績效", "perf", "勝率", "交易記錄"]:
+        await cmd_jixiao(update, context)
+    elif keyword in ["月營收", "revenue", "營收"]:
+        await cmd_yingye(update, context)
+    elif keyword in ["評分", "score", "打分"]:
+        await cmd_pingfen(update, context)
+    elif keyword in ["日誌", "交易日誌", "journal", "記錄"]:
+        await cmd_riji(update, context)
+    elif keyword in ["週報", "weekly", "周報"]:
+        await cmd_zhoubao(update, context)
     elif text.isdigit() and len(text) == 4:
         context.args = [text]; await cmd_gujia(update, context)
     else:
@@ -607,12 +1038,17 @@ def run_scheduler(bot_token: str, user_ids: list):
     async def send_report():
         from telegram import Bot
         bot = Bot(token=bot_token)
-        report = await daily_learning_task()
-        for uid in user_ids:
-            try:
-                await bot.send_message(chat_id=uid, text=report)
-            except Exception as e:
-                logger.error(f"推播失敗 {uid}: {e}")
+        # 每日報告分多則推播
+        try:
+            messages = await daily_report_task()
+            for uid in user_ids:
+                for msg in messages:
+                    try:
+                        await bot.send_message(chat_id=uid, text=msg)
+                    except Exception as e:
+                        logger.error(f"推播失敗 {uid}: {e}")
+        except Exception as e:
+            logger.error(f"每日報告失敗: {e}")
 
     async def check_alerts():
         from telegram import Bot
@@ -640,8 +1076,78 @@ def run_scheduler(bot_token: str, user_ids: list):
             asyncio.run(check_alerts())
 
     schedule.every().day.at("15:35").do(daily_job)
+
+    # 每週日 20:00 自動發送週報
+    def weekly_job():
+        async def send():
+            from telegram import Bot
+            bot = Bot(token=bot_token)
+            report = await generate_weekly_report(claude_client, user_ids[0] if user_ids else 0)
+            for uid in user_ids:
+                try:
+                    await bot.send_message(chat_id=uid, text=report)
+                except: pass
+        asyncio.run(send())
+
+    schedule.every().sunday.at("20:00").do(weekly_job)
+
+    def weekly_job():
+        async def send_weekly():
+            from telegram import Bot
+            bot = Bot(token=bot_token)
+            report = format_weekly_report()
+            for uid in user_ids:
+                try:
+                    await bot.send_message(chat_id=uid, text=report)
+                except: pass
+        asyncio.run(send_weekly())
+
+    schedule.every().sunday.at("20:00").do(weekly_job)
     schedule.every(15).minutes.do(alert_job)
-    logger.info("排程器啟動：每日15:35推播 | 盤中每15分鐘監控持股")
+
+    def weekly_job():
+        if datetime.now().weekday() == 6:  # 週日
+            async def send_weekly():
+                from telegram import Bot
+                bot = Bot(token=bot_token)
+                report = await generate_weekly_report()
+                for uid in user_ids:
+                    try:
+                        await bot.send_message(chat_id=uid, text=report)
+                    except: pass
+            asyncio.run(send_weekly())
+
+    schedule.every().day.at("20:00").do(weekly_job)
+
+    # 每日報告（收盤後自動推播）
+    async def send_daily_journal():
+        from telegram import Bot
+        bot = Bot(token=bot_token)
+        report = generate_daily_report()
+        for uid in user_ids:
+            try:
+                await bot.send_message(chat_id=uid, text=report)
+            except: pass
+
+    def daily_journal_job():
+        asyncio.run(send_daily_journal())
+
+    # 週報（每週日晚上20:00）
+    async def send_weekly():
+        from telegram import Bot
+        bot = Bot(token=bot_token)
+        report = generate_weekly_report()
+        for uid in user_ids:
+            try:
+                await bot.send_message(chat_id=uid, text=report)
+            except: pass
+
+    def weekly_job():
+        asyncio.run(send_weekly())
+
+    schedule.every().day.at("16:00").do(daily_journal_job)
+    schedule.every().sunday.at("20:00").do(weekly_job)
+    logger.info("排程器啟動：每日15:35學習推播 | 16:00交易日誌 | 週日20:00週報 | 盤中每15分鐘監控")
     while True:
         schedule.run_pending()
         time.sleep(60)
@@ -677,15 +1183,38 @@ def main():
     app.add_handler(CommandHandler("portfolio", cmd_chicang))
     app.add_handler(CommandHandler("check",     cmd_jiancha))
     app.add_handler(CommandHandler("calc",      cmd_jianyi_zhangshui))
+    app.add_handler(CommandHandler("report",    cmd_daily_report))
+    app.add_handler(CommandHandler("score",     cmd_score_stock))
     app.add_handler(CommandHandler("risk",      cmd_fengkong))
     app.add_handler(CommandHandler("riskset",   cmd_fengkong_shezhi))
     app.add_handler(CommandHandler("mktcheck",  cmd_shichang_fengxian))
     app.add_handler(CommandHandler("backtest",  cmd_huice))
+    app.add_handler(CommandHandler("score",     cmd_pingfen))
+    app.add_handler(CommandHandler("report",    cmd_rijibao))
+    app.add_handler(CommandHandler("jilu",      cmd_jilu))
+    app.add_handler(CommandHandler("stats",     cmd_jilu_tongji))
+    app.add_handler(CommandHandler("score",     cmd_pingfen))
+    app.add_handler(CommandHandler("trades",    cmd_jiaoyijilu))
+    app.add_handler(CommandHandler("stats",     cmd_jiaoyitongji))
+    app.add_handler(CommandHandler("score",     cmd_pingfen))
+    app.add_handler(CommandHandler("weekly",    cmd_zhoubao))
+    app.add_handler(CommandHandler("journal",   cmd_jiaoyijilu))
+    app.add_handler(CommandHandler("score",     cmd_pingfen))
+    app.add_handler(CommandHandler("journal",   cmd_riji))
+    app.add_handler(CommandHandler("stats",     cmd_jixiao))
+    app.add_handler(CommandHandler("weekly",    cmd_zhoubao))
+    app.add_handler(CommandHandler("score",     cmd_pingfen))
+    app.add_handler(CommandHandler("journal",   cmd_riji))
+    app.add_handler(CommandHandler("weekly",    cmd_zhoubao))
     app.add_handler(CommandHandler("teach",     cmd_xinzeng_guize))
     app.add_handler(CommandHandler("rules",     cmd_guize_qingdan))
     app.add_handler(CommandHandler("delrule",   cmd_shanchu_guize))
     app.add_handler(CommandHandler("learning",  cmd_xuexi_jilu))
     app.add_handler(CommandHandler("train",     cmd_xunlian))
+    app.add_handler(CommandHandler("score",     cmd_pingfen))
+    app.add_handler(CommandHandler("perf",      cmd_jixiao))
+    app.add_handler(CommandHandler("revenue",   cmd_yingye))
+    app.add_handler(CommandHandler("update",    cmd_update_now))
     app.add_handler(CommandHandler("db",        cmd_shujuku))
     app.add_handler(CommandHandler("dbinit",    cmd_chushihua))
     app.add_handler(CommandHandler("stocks",    cmd_gengxin_qingdan))
