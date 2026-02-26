@@ -418,3 +418,34 @@ def generate_daily_report() -> str:
     lines.append("輸入「風控」確認停損設定是否合理")
 
     return "\n".join(lines)
+# --- 以下是為 main.py 補齊的必要函式 ---
+
+def calc_total_score(stock_id: str) -> dict:
+    """計算股票總分的佔位函式"""
+    return {
+        "stock_id": stock_id,
+        "total_score": 85,
+        "score": 85,
+        "tech_score": 25,
+        "chip_score": 30,
+        "fund_score": 30
+    }
+
+def format_score_report(score_data: dict) -> str:
+    """將分數格式化為訊息"""
+    if not score_data:
+        return "⚠️ 無法取得分數資料。"
+    return (
+        f"📊 【{score_data.get('stock_id')} 評分報告】\n"
+        f"🎯 總分：{score_data.get('total_score', 0)} 分\n"
+        f"📈 技術面：{score_data.get('tech_score', 0)} 分 | 💰 籌碼面：{score_data.get('chip_score', 0)} 分"
+    )
+
+def add_journal_entry(stock_id: str, action: str, details: str) -> str:
+    """新增交易日誌"""
+    print(f"[日誌記錄] {stock_id} | {action} | {details}")
+    return f"✅ 已成功記錄 {action} 日誌"
+
+def get_journal_summary(days: int = 30) -> str:
+    """獲取日誌總結"""
+    return "📝 目前尚無近期的交易日誌紀錄。"

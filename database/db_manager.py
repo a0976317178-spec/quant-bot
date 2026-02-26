@@ -37,7 +37,7 @@ CRAWL_CONFIG = {
 
 # ── 防 Ban 請求函式 ───────────────────────────────
 
-def safe_request(url: str, params: dict = None, method: str = "GET") -> requests.Response | None:
+def safe_request(url: str, params: dict = None, method: str = "GET") -> object:
     """
     防 Ban 的安全請求函式
     - 隨機 User-Agent
@@ -234,7 +234,7 @@ def query_df(sql: str, params: tuple = ()):
         return pd.read_sql_query(sql, conn, params=params)
 
 
-def get_crawl_progress(task_name: str) -> str | None:
+def get_crawl_progress(task_name: str) -> object:
     """取得爬蟲斷點日期"""
     with get_conn() as conn:
         row = conn.execute(
