@@ -1,16 +1,13 @@
 """
-alert/daily_alert.py - 每日選股提醒（升級版）
-新增功能：
-  🥇 訊號追蹤表：自動記錄每次訊號，收盤後驗證漲跌
-  🥈 52週高低點：標示現價在52週區間的位置
-  🥉 族群強弱：掃描時同步計算各族群平均報酬
-  🏅 動態評分權重：根據近期哪個因子最準，自動調整權重
-  💳 融資餘額：爬取融資餘額變化，高融資=散戶擁擠=風險
+alert/daily_alert.py - 每日選股提醒（完整版 v3）
+功能清單：
+  🥇 訊號追蹤+驗證    🥈 52週高低點+突破判斷
+  🥉 族群強弱比較     🏅 動態評分權重
+  💳 融資餘額         🔵 外資連買天數
+  📊 停利停損顯示     🏆 回測勝率標註
+  👑 產業龍頭標記     💎 籌碼集中度
 """
-import json
-import logging
-import os
-import threading
+import json, logging, os, threading
 from datetime import datetime, timedelta
 from database.db_manager import query_df, get_conn
 
@@ -23,6 +20,7 @@ MIN_PRICE       = 10.0
 MAX_PRICE       = 2000.0
 SIGNAL_LOG_PATH = "data/signal_log.jsonl"
 WEIGHT_PATH     = "data/dynamic_weights.json"
+BACKTEST_PATH   = "data/backtest_winrate.json"
 
 def _ensure_dir():
     os.makedirs("data", exist_ok=True)
@@ -59,7 +57,7 @@ def verify_signals() -> str:
             continue
         current = float(df.iloc[0]["close"])
         ret = (current - rec["entry"]) / rec["entry"] * 100
-        results.append({**rec, "current": current, "ret_pct": round(ret, 2)})
+        results.append({**rec, "current": round(current,2), "ret_pct": round(ret,2)})
     if not results:
         return ""
     wins = [r for r in results if r["ret_pct"] > 0]
@@ -83,11 +81,14 @@ def verify_signals() -> str:
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
     return "\n".join(lines)
 
-# ══ 🥈 52週高低點 ═════════════════════════════════════════
+# ══ 🥈 52週高低點 + 突破判斷 ══════════════════════════════
 
-def get_52w_position(stock_id, current) -> dict:
+def get_52w_position(stock_id, current, vol_ratio=1.0, rsi=50.0) -> dict:
     try:
-        df = query_df("SELECT MAX(high) as h, MIN(low) as l FROM daily_price WHERE stock_id=? AND date >= date('now', '-365 days')", (stock_id,))
+        df = query_df("""
+            SELECT MAX(high) as h, MIN(low) as l FROM daily_price
+            WHERE stock_id=? AND date >= date('now', '-365 days')
+        """, (stock_id,))
         if df.empty or df.iloc[0]["h"] is None:
             return {}
         high52 = float(df.iloc[0]["h"])
@@ -96,7 +97,24 @@ def get_52w_position(stock_id, current) -> dict:
         if rng <= 0:
             return {}
         position = (current - low52) / rng * 100
-        return {"high52": round(high52,2), "low52": round(low52,2), "position": round(position,1)}
+
+        # 突破判斷
+        if position >= 85:
+            if vol_ratio >= 1.5 and rsi <= 72:
+                breakout = "突破"   # 真突破：爆量+RSI未超買
+            elif rsi > 72:
+                breakout = "追高"   # RSI過熱
+            else:
+                breakout = "測試"   # 量縮測試高點
+        else:
+            breakout = ""
+
+        return {
+            "high52":   round(high52, 2),
+            "low52":    round(low52, 2),
+            "position": round(position, 1),
+            "breakout": breakout,
+        }
     except Exception:
         return {}
 
@@ -106,10 +124,89 @@ def format_52w(pos) -> str:
     p = pos["position"]
     bar_filled = int(p / 10)
     bar = "▓" * bar_filled + "░" * (10 - bar_filled)
-    note = "近高點" if p >= 80 else ("偏高" if p >= 60 else ("中間" if p >= 40 else ("偏低✨" if p >= 20 else "近低點✨")))
-    return f"[{bar}]{p:.0f}%{note}"
+    note = (
+        f"🚀突破新高" if pos.get("breakout") == "突破" else
+        f"⚠️追高危險" if pos.get("breakout") == "追高" else
+        f"🔍測試高點" if pos.get("breakout") == "測試" else
+        "偏低✨" if p < 20 else
+        "偏低✨" if p < 35 else
+        "中間" if p < 65 else
+        "偏高"
+    )
+    return f"[{bar}]{p:.0f}% {note}"
 
-# ══ 🥉 族群強弱 ═══════════════════════════════════════════
+# ══ 🔵 外資連買天數 ═══════════════════════════════════════
+
+def get_foreign_consecutive(stock_id) -> dict:
+    try:
+        df = query_df("""
+            SELECT date, foreign_net FROM institutional
+            WHERE stock_id=? ORDER BY date DESC LIMIT 10
+        """, (stock_id,))
+        if df.empty:
+            return {}
+        consecutive_buy  = 0
+        consecutive_sell = 0
+        total_net = 0
+        for _, row in df.iterrows():
+            net = int(row["foreign_net"])
+            total_net += net
+            if net > 0:
+                if consecutive_sell == 0:
+                    consecutive_buy += 1
+            else:
+                if consecutive_buy == 0:
+                    consecutive_sell += 1
+                else:
+                    break
+        return {
+            "buy_days":  consecutive_buy,
+            "sell_days": consecutive_sell,
+            "net_10d":   total_net,
+        }
+    except Exception:
+        return {}
+
+def format_foreign(fg) -> str:
+    if not fg:
+        return ""
+    if fg["buy_days"] >= 3:
+        return f"🔵外資連買{fg['buy_days']}天"
+    elif fg["buy_days"] >= 1:
+        return f"外資買{fg['buy_days']}天"
+    elif fg["sell_days"] >= 3:
+        return f"🔴外資連賣{fg['sell_days']}天"
+    return ""
+
+# ══ 🏆 回測勝率 ═══════════════════════════════════════════
+
+def calc_historical_winrate(stock_id, closes, volumes) -> str:
+    """
+    回測：過去所有類似訊號（站上MA20+放量）發出後3天的勝率
+    """
+    try:
+        if len(closes) < 65:
+            return ""
+        wins = total = 0
+        for i in range(60, len(closes)-3):
+            window = closes[i:i+20]
+            ma20 = sum(window) / 20
+            vol_window = volumes[i:i+20]
+            vol_ma = sum(vol_window) / 20 if vol_window else 1
+            # 類似訊號條件
+            if closes[i] > ma20 and volumes[i] > vol_ma * 1.3:
+                ret_3d = (closes[i-3] / closes[i] - 1) * 100  # 注意：closes是倒序
+                total += 1
+                if ret_3d > 0:
+                    wins += 1
+        if total < 5:
+            return ""
+        wr = wins / total * 100
+        return f"歷史勝率{wr:.0f}%({total}次)"
+    except Exception:
+        return ""
+
+# ══ 👑 產業龍頭標記 ═══════════════════════════════════════
 
 SECTOR_MAP = {
     "半導體": ["台積", "聯發", "聯電", "日月光"],
@@ -136,58 +233,50 @@ def get_sector_strength() -> dict:
             results[sector] = round(sum(returns) / len(returns), 2)
     return results
 
-# ══ 🏅 動態權重 ═══════════════════════════════════════════
+# ══ 💎 籌碼集中度 ═════════════════════════════════════════
 
-DEFAULT_WEIGHTS = {"ma_trend": 1.0, "rsi": 1.0, "volume": 1.0, "bias": 1.0, "momentum": 1.0}
-
-def load_weights() -> dict:
-    _ensure_dir()
-    if not os.path.exists(WEIGHT_PATH):
-        return DEFAULT_WEIGHTS.copy()
+def get_chip_concentration(stock_id) -> dict:
+    """
+    法人持股比例：外資+投信淨買超越多，籌碼越集中越安全
+    """
     try:
-        with open(WEIGHT_PATH, "r") as f:
-            return json.load(f)
+        df = query_df("""
+            SELECT foreign_net, trust_net, total_net FROM institutional
+            WHERE stock_id=? ORDER BY date DESC LIMIT 20
+        """, (stock_id,))
+        if df.empty:
+            return {}
+        foreign_20d = int(df["foreign_net"].sum())
+        trust_20d   = int(df["trust_net"].sum())
+        total_20d   = int(df["total_net"].sum())
+        return {
+            "foreign_20d": foreign_20d,
+            "trust_20d":   trust_20d,
+            "total_20d":   total_20d,
+        }
     except Exception:
-        return DEFAULT_WEIGHTS.copy()
+        return {}
 
-def update_weights():
-    _ensure_dir()
-    if not os.path.exists(SIGNAL_LOG_PATH):
-        return
-    try:
-        wins = losses = 0
-        with open(SIGNAL_LOG_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                obj = json.loads(line.strip())
-                if obj.get("verified") and obj.get("ret_pct") is not None:
-                    if obj["ret_pct"] > 2:
-                        wins += 1
-                    elif obj["ret_pct"] < -2:
-                        losses += 1
-        total = wins + losses
-        if total < 5:
-            return
-        wr = wins / total
-        weights = load_weights()
-        if wr >= 0.6:
-            weights["volume"]   = min(1.5, weights["volume"]   * 1.05)
-            weights["momentum"] = min(1.5, weights["momentum"] * 1.05)
-        else:
-            weights["ma_trend"] = min(1.5, weights["ma_trend"] * 1.1)
-            weights["bias"]     = max(0.5, weights["bias"]     * 0.9)
-        avg = sum(weights.values()) / len(weights)
-        weights = {k: round(v/avg, 3) for k, v in weights.items()}
-        with open(WEIGHT_PATH, "w") as f:
-            json.dump(weights, f, indent=2)
-        logger.info(f"動態權重更新：{weights}")
-    except Exception as e:
-        logger.warning(f"更新權重失敗: {e}")
+def format_chip(chip) -> str:
+    if not chip:
+        return ""
+    t = chip["total_20d"]
+    if t > 5000:
+        return f"💎籌碼集中(法人20日+{t//1000:.0f}千張)"
+    elif t > 1000:
+        return f"法人買超(+{t//1000:.1f}千張)"
+    elif t < -3000:
+        return f"⚠️法人賣超({t//1000:.0f}千張)"
+    return ""
 
 # ══ 💳 融資餘額 ═══════════════════════════════════════════
 
 def get_margin_ratio(stock_id) -> dict:
     try:
-        df = query_df("SELECT margin_balance, margin_change FROM margin_trading WHERE stock_id=? ORDER BY date DESC LIMIT 5", (stock_id,))
+        df = query_df("""
+            SELECT margin_balance, margin_change FROM margin_trading
+            WHERE stock_id=? ORDER BY date DESC LIMIT 5
+        """, (stock_id,))
         if df.empty:
             return {}
         latest   = int(df.iloc[0]["margin_balance"])
@@ -244,11 +333,55 @@ def crawl_margin_trading():
                     continue
             if records:
                 with get_conn() as conn:
-                    conn.executemany("INSERT OR REPLACE INTO margin_trading (stock_id, date, margin_balance, margin_change) VALUES (?,?,?,?)", records)
+                    conn.executemany("INSERT OR REPLACE INTO margin_trading (stock_id,date,margin_balance,margin_change) VALUES (?,?,?,?)", records)
                 logger.info(f"融資 {date_db}：{len(records)} 筆")
             time.sleep(0.5)
         except Exception as e:
             logger.warning(f"融資爬取失敗 {date_db}: {e}")
+
+# ══ 動態權重 ══════════════════════════════════════════════
+
+DEFAULT_WEIGHTS = {"ma_trend": 1.0, "rsi": 1.0, "volume": 1.0, "bias": 1.0, "momentum": 1.0}
+
+def load_weights() -> dict:
+    _ensure_dir()
+    if not os.path.exists(WEIGHT_PATH):
+        return DEFAULT_WEIGHTS.copy()
+    try:
+        with open(WEIGHT_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return DEFAULT_WEIGHTS.copy()
+
+def update_weights():
+    _ensure_dir()
+    if not os.path.exists(SIGNAL_LOG_PATH):
+        return
+    try:
+        wins = losses = 0
+        with open(SIGNAL_LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                obj = json.loads(line.strip())
+                if obj.get("verified") and obj.get("ret_pct") is not None:
+                    if obj["ret_pct"] > 2:   wins += 1
+                    elif obj["ret_pct"] < -2: losses += 1
+        total = wins + losses
+        if total < 5:
+            return
+        wr = wins / total
+        weights = load_weights()
+        if wr >= 0.6:
+            weights["volume"]   = min(1.5, weights["volume"]   * 1.05)
+            weights["momentum"] = min(1.5, weights["momentum"] * 1.05)
+        else:
+            weights["ma_trend"] = min(1.5, weights["ma_trend"] * 1.1)
+            weights["bias"]     = max(0.5, weights["bias"]     * 0.9)
+        avg = sum(weights.values()) / len(weights)
+        weights = {k: round(v/avg, 3) for k, v in weights.items()}
+        with open(WEIGHT_PATH, "w") as f:
+            json.dump(weights, f, indent=2)
+    except Exception as e:
+        logger.warning(f"更新權重失敗: {e}")
 
 # ══ 核心掃描 ══════════════════════════════════════════════
 
@@ -323,18 +456,35 @@ def _quick_score(stock_id, weights) -> dict:
             row = conn.execute("SELECT name FROM stocks WHERE stock_id=?", (stock_id,)).fetchone()
             if row:
                 name = row["name"]
+
+        # 歷史回測勝率
+        winrate_str = calc_historical_winrate(stock_id, closes, volumes)
+
         return {
-            "stock_id": stock_id, "name": name, "score": score,
-            "close": round(current, 2), "vol_today": vol_today,
-            "vol_ratio": round(vol_ratio, 1), "rsi": round(rsi, 1),
-            "ma20": round(ma20, 2), "ma60": round(ma60, 2),
-            "bias": round(bias, 1), "ret_5d": round(ret_5d, 1),
-            "entry_low": round(current*0.99,2), "entry_high": round(current*1.01,2),
-            "stop_loss": round(current*0.95,2), "target": round(current*1.10,2),
+            "stock_id":    stock_id,
+            "name":        name,
+            "score":       score,
+            "close":       round(current, 2),
+            "vol_today":   vol_today,
+            "vol_ratio":   round(vol_ratio, 1),
+            "rsi":         round(rsi, 1),
+            "ma20":        round(ma20, 2),
+            "ma60":        round(ma60, 2),
+            "bias":        round(bias, 1),
+            "ret_5d":      round(ret_5d, 1),
+            "entry_low":   round(current * 0.99, 2),
+            "entry_high":  round(current * 1.01, 2),
+            "stop_loss":   round(current * 0.95, 2),
+            "target":      round(current * 1.10, 2),
+            "winrate_str": winrate_str,
+            "closes":      closes,
+            "volumes":     volumes,
         }
     except Exception as e:
         logger.debug(f"{stock_id} 評分失敗: {e}")
         return None
+
+# ══ 主掃描流程 ════════════════════════════════════════════
 
 def run_daily_scan(mode: str = "close") -> str:
     now   = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -357,6 +507,19 @@ def run_daily_scan(mode: str = "close") -> str:
         if r and r["score"] >= MIN_SCORE:
             candidates.append(r)
     candidates.sort(key=lambda x: (x["score"], x["vol_ratio"]), reverse=True)
+
+    # 👑 標記各族群龍頭（同族群中評分最高的）
+    sector_leaders = set()
+    sector_best = {}
+    for c in candidates:
+        name = c["name"]
+        for sector, keywords in SECTOR_MAP.items():
+            if any(kw in name for kw in keywords):
+                if sector not in sector_best or c["score"] > sector_best[sector]["score"]:
+                    sector_best[sector] = c
+    for s in sector_best.values():
+        sector_leaders.add(s["stock_id"])
+
     top = candidates[:MAX_RESULTS]
     t.join(timeout=10)
     for s in top:
@@ -376,23 +539,52 @@ def run_daily_scan(mode: str = "close") -> str:
         f"",
     ]
     for s in top:
+        is_leader = s["stock_id"] in sector_leaders
         emoji = "🔥" if s["score"] >= 80 else ("✅" if s["score"] >= 70 else "📈")
+        crown = "👑" if is_leader else ""
         grade = "強力" if s["score"] >= 80 else ("優質" if s["score"] >= 70 else "觀察")
         vol_note = f"爆量{s['vol_ratio']}x" if s["vol_ratio"] >= 2.0 else (f"放量{s['vol_ratio']}x" if s["vol_ratio"] >= 1.5 else "正常")
         vol_str  = f"{s['vol_today']//10000:.1f}萬" if s["vol_today"] >= 10000 else f"{s['vol_today']//1000:.1f}千"
-        pos52    = get_52w_position(s["stock_id"], s["close"])
-        pos52_str = f" 52W:{format_52w(pos52)}" if pos52 else ""
+
+        # 各項指標
+        pos52  = get_52w_position(s["stock_id"], s["close"], s["vol_ratio"], s["rsi"])
+        fg     = get_foreign_consecutive(s["stock_id"])
         mg     = get_margin_ratio(s["stock_id"])
-        mg_str = f" {format_margin(mg)}" if format_margin(mg) else ""
-        lines.append(
-            f"{emoji}{s['stock_id']} {s['name']} {s['score']}分{grade}|"
+        chip   = get_chip_concentration(s["stock_id"])
+
+        pos52_str = f" 52W:{format_52w(pos52)}" if pos52 else ""
+        fg_str    = f" {format_foreign(fg)}"    if format_foreign(fg) else ""
+        mg_str    = f" {format_margin(mg)}"     if format_margin(mg) else ""
+        chip_str  = f" {format_chip(chip)}"     if format_chip(chip) else ""
+        wr_str    = f" [{s['winrate_str']}]"    if s.get("winrate_str") else ""
+
+        # ⚠️ 追高警告降分
+        breakout_tag = pos52.get("breakout", "") if pos52 else ""
+        if breakout_tag == "追高":
+            warning = " ⚠️高風險勿追"
+        elif breakout_tag == "突破":
+            warning = " 🚀可追突破"
+        else:
+            warning = ""
+
+        # 第一行：基本資訊
+        line1 = (
+            f"{emoji}{crown}{s['stock_id']} {s['name']} {s['score']}分{grade}|"
             f"${s['close']}|{vol_str}({vol_note})|RSI={s['rsi']}|5日={s['ret_5d']:+.1f}%"
-            f"{pos52_str}{mg_str}"
+            f"{warning}"
         )
+        # 第二行：進階資訊
+        line2 = (
+            f"   進場${s['entry_low']}~${s['entry_high']} 停損${s['stop_loss']}(-5%) 停利${s['target']}(+10%)"
+            f"{pos52_str}{fg_str}{mg_str}{chip_str}{wr_str}"
+        )
+        lines.append(line1)
+        lines.append(line2)
+
     if sector_data:
         lines.append("")
         sorted_s = sorted(sector_data.items(), key=lambda x: x[1], reverse=True)
-        lines.append("🏭 族群強弱：" + "  ".join(
+        lines.append("🏭 族群：" + "  ".join(
             f"{'🔥' if v>3 else ('✅' if v>0 else '🔴')}{k}{v:+.1f}%" for k, v in sorted_s
         ))
     verification = verify_signals()
