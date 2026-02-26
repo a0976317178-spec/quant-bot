@@ -47,6 +47,7 @@ from ml.self_learning import (
     update_win_rate, get_win_rate_report,
     get_strategy_advice, weekly_self_learning
 )
+from memory.ai_self_learning import get_self_learning_summary, run_daily_self_learning
 
 load_dotenv()
 logging.basicConfig(
@@ -546,7 +547,8 @@ async def cmd_delrule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_learning(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id): return
-    await update.message.reply_text(get_recent_learnings(days=7))
+    report = get_self_learning_summary(days=7)
+    await update.message.reply_text(report if report else get_recent_learnings(days=7))
 
 
 async def cmd_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -646,6 +648,18 @@ async def cmd_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════
+
+async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("📰 爬取今日台股新聞中，請稍候約30秒...")
+    try:
+        from news.tw_stock_news import run_daily_news_summary
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            report = executor.submit(run_daily_news_summary, claude_client).result(timeout=90)
+        for i in range(0, len(report), 4000):
+            await update.message.reply_text(report[i:i+4000])
+    except Exception as e:
+        await update.message.reply_text(f"新聞取得失敗：{e}")
 # 文字訊息路由
 # ══════════════════════════════════════════════════════
 
@@ -666,6 +680,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("清單", "監控清單", "自選股"): cmd_list,
         # 選股
         ("選股", "掃描", "screen"): cmd_screen,
+        ("新聞", "今日新聞", "news"): cmd_news,
         # 宏觀
         ("宏觀", "大盤", "市場", "macro"): cmd_macro,
         # 持股
