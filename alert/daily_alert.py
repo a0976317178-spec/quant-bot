@@ -538,48 +538,58 @@ def run_daily_scan(mode: str = "close") -> str:
         f"⚖️ 動態權重：{w_str}",
         f"",
     ]
-    for s in top:
+    for i, s in enumerate(top):
         is_leader = s["stock_id"] in sector_leaders
-        emoji = "🔥" if s["score"] >= 80 else ("✅" if s["score"] >= 70 else "📈")
+        score_emoji = "🔥" if s["score"] >= 80 else ("✅" if s["score"] >= 70 else "📈")
         crown = "👑" if is_leader else ""
-        grade = "強力" if s["score"] >= 80 else ("優質" if s["score"] >= 70 else "觀察")
-        vol_note = f"爆量{s['vol_ratio']}x" if s["vol_ratio"] >= 2.0 else (f"放量{s['vol_ratio']}x" if s["vol_ratio"] >= 1.5 else "正常")
-        vol_str  = f"{s['vol_today']//10000:.1f}萬" if s["vol_today"] >= 10000 else f"{s['vol_today']//1000:.1f}千"
+        grade = "強力訊號" if s["score"] >= 80 else ("優質訊號" if s["score"] >= 70 else "觀察訊號")
+        vol_note = f"爆量 {s['vol_ratio']}x" if s["vol_ratio"] >= 2.0 else (f"放量 {s['vol_ratio']}x" if s["vol_ratio"] >= 1.5 else "量能正常")
+        vol_str  = f"{s['vol_today']//10000:.1f}萬張" if s["vol_today"] >= 10000 else f"{s['vol_today']//1000:.1f}千張"
 
-        # 各項指標
-        pos52  = get_52w_position(s["stock_id"], s["close"], s["vol_ratio"], s["rsi"])
-        fg     = get_foreign_consecutive(s["stock_id"])
-        mg     = get_margin_ratio(s["stock_id"])
-        chip   = get_chip_concentration(s["stock_id"])
+        pos52 = get_52w_position(s["stock_id"], s["close"], s["vol_ratio"], s["rsi"])
+        fg    = get_foreign_consecutive(s["stock_id"])
+        mg    = get_margin_ratio(s["stock_id"])
+        chip  = get_chip_concentration(s["stock_id"])
 
-        pos52_str = f" 52W:{format_52w(pos52)}" if pos52 else ""
-        fg_str    = f" {format_foreign(fg)}"    if format_foreign(fg) else ""
-        mg_str    = f" {format_margin(mg)}"     if format_margin(mg) else ""
-        chip_str  = f" {format_chip(chip)}"     if format_chip(chip) else ""
-        wr_str    = f" [{s['winrate_str']}]"    if s.get("winrate_str") else ""
-
-        # ⚠️ 追高警告降分
         breakout_tag = pos52.get("breakout", "") if pos52 else ""
-        if breakout_tag == "追高":
-            warning = " ⚠️高風險勿追"
-        elif breakout_tag == "突破":
-            warning = " 🚀可追突破"
+        if breakout_tag == "突破":
+            signal_tag = "🚀 突破新高，可積極追"
+        elif breakout_tag == "追高":
+            signal_tag = "⛔ 近高點量縮，風險高"
+        elif breakout_tag == "測試":
+            signal_tag = "🔍 測試高點，觀望為主"
         else:
-            warning = ""
+            p = pos52.get("position", 50) if pos52 else 50
+            signal_tag = "✨ 低檔布局區" if p < 35 else ""
 
-        # 第一行：基本資訊
-        line1 = (
-            f"{emoji}{crown}{s['stock_id']} {s['name']} {s['score']}分{grade}|"
-            f"${s['close']}|{vol_str}({vol_note})|RSI={s['rsi']}|5日={s['ret_5d']:+.1f}%"
-            f"{warning}"
-        )
-        # 第二行：進階資訊
-        line2 = (
-            f"   進場${s['entry_low']}~${s['entry_high']} 停損${s['stop_loss']}(-5%) 停利${s['target']}(+10%)"
-            f"{pos52_str}{fg_str}{mg_str}{chip_str}{wr_str}"
-        )
-        lines.append(line1)
-        lines.append(line2)
+        fg_fmt   = format_foreign(fg)
+        mg_fmt   = format_margin(mg)
+        chip_fmt = format_chip(chip)
+        wr_str   = s.get("winrate_str", "")
+
+        if pos52:
+            p = pos52["position"]
+            bar = "▓" * int(p/10) + "░" * (10 - int(p/10))
+            pos52_line = f"📊 [{bar}] {p:.0f}%  低${pos52['low52']} ~ 高${pos52['high52']}"
+        else:
+            pos52_line = ""
+
+        lines.append(f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
+        lines.append(f"{score_emoji}{crown} {s['stock_id']} {s['name']}　{s['score']}分 {grade}")
+        if signal_tag:
+            lines.append(f"   {signal_tag}")
+        lines.append(f"💰 現價 ${s['close']}　5日 {s['ret_5d']:+.1f}%　RSI {s['rsi']}")
+        lines.append(f"📦 {vol_str}　{vol_note}")
+        lines.append(f"🎯 進場 ${s['entry_low']} ～ ${s['entry_high']}")
+        lines.append(f"🛡 停損 ${s['stop_loss']}（-5%）　停利 ${s['target']}（+10%）")
+        if pos52_line:
+            lines.append(f"   {pos52_line}")
+        extras = [x for x in [fg_fmt, mg_fmt, chip_fmt] if x]
+        if extras:
+            lines.append("   " + "   ".join(extras))
+        if wr_str:
+            lines.append(f"   📈 {wr_str}")
+        lines.append(f"   👉 分析 {s['stock_id']}")
 
     if sector_data:
         lines.append("")
