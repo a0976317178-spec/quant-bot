@@ -1,0 +1,19 @@
+nohup: ignoring input
+2026-02-26 14:13:17,630 - INFO - 資料庫初始化完成：/root/quant-bot/data/quant.db
+2026-02-26 14:13:17,637 - INFO - 排程器啟動：15:10更新資料 | 15:35推報告 | 每15分鐘監控 | 週日學習
+2026-02-26 14:13:17,808 - INFO - 量化交易 Bot 已啟動
+2026-02-26 14:13:18,212 - INFO - HTTP Request: POST https://api.telegram.org/bot8536092644:AAGDxKoczPOGBYnxJu0BHTtxUnOwTzjaFsc/getMe "HTTP/1.1 200 OK"
+2026-02-26 14:13:18,337 - INFO - HTTP Request: POST https://api.telegram.org/bot8536092644:AAGDxKoczPOGBYnxJu0BHTtxUnOwTzjaFsc/deleteWebhook "HTTP/1.1 200 OK"
+2026-02-26 14:13:18,340 - INFO - Application started
+2026-02-26 14:13:18,722 - INFO - HTTP Request: POST https://api.telegram.org/bot8536092644:AAGDxKoczPOGBYnxJu0BHTtxUnOwTzjaFsc/getUpdates "HTTP/1.1 200 OK"
+2026-02-26 14:13:19,038 - INFO - HTTP Request: POST https://api.telegram.org/bot8536092644:AAGDxKoczPOGBYnxJu0BHTtxUnOwTzjaFsc/sendMessage "HTTP/1.1 200 OK"
+2026-02-26 14:13:19,049 - INFO - 開始全市場掃描 [close] 2026-02-26 14:13
+2026-02-26 14:13:20,227 - INFO - 開始掃描 2244 支股票...
+2026-02-26 14:13:30,173 - INFO - 掃描完成：153 支符合條件，取前 50 支
+2026-02-26 14:13:30,182 - INFO - HTTP Request: POST https://api.telegram.org/bot8536092644:AAGDxKoczPOGBYnxJu0BHTtxUnOwTzjaFsc/getUpdates "HTTP/1.1 200 OK"
+2026-02-26 14:13:30,819 - INFO - HTTP Request: POST https://api.telegram.org/bot8536092644:AAGDxKoczPOGBYnxJu0BHTtxUnOwTzjaFsc/sendMessage "HTTP/1.1 200 OK"
+2026-02-26 14:13:40,312 - INFO - HTTP Request: POST https://api.telegram.org/bot8536092644:AAGDxKoczPOGBYnxJu0BHTtxUnOwTzjaFsc/getUpdates "HTTP/1.1 200 OK"
+2026-02-26 14:13:50,440 - INFO - HTTP Request: POST https://api.telegram.org/bot8536092644:AAGDxKoczPOGBYnxJu0BHTtxUnOwTzjaFsc/getUpdates "HTTP/1.1 200 OK"
+2026-02-26 14:14:00,571 - INFO - HTTP Request: POST https://api.telegram.org/bot8536092644:AAGDxKoczPOGBYnxJu0BHTtxUnOwTzjaFsc/getUpdates "HTTP/1.1 200 OK"
+2026-02-26 14:14:10,700 - INFO - HTTP Request: POST https://api.telegram.org/bot8536092644:AAGDxKoczPOGBYnxJu0BHTtxUnOwTzjaFsc/getUpdates "HTTP/1.1 200 OK"
+2026-02-26 14:14:20,832 - INFO - HTTP Request: POST https://api.telegram.org/bot8536092644:AAGDxKoczPOGBYnxJu0BHTtxUnOwTzjaFsc/getUpdates "HTTP/1.1 200 OK"

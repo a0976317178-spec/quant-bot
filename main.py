@@ -48,6 +48,7 @@ from ml.self_learning import (
     get_strategy_advice, weekly_self_learning
 )
 from memory.ai_self_learning import get_self_learning_summary, run_daily_self_learning
+from alert.daily_alert import run_daily_scan, run_open_alert, run_close_alert
 
 load_dotenv()
 logging.basicConfig(
@@ -660,6 +661,17 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(report[i:i+4000])
     except Exception as e:
         await update.message.reply_text(f"新聞取得失敗：{e}")
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("🔍 全市場掃描中，約需 30~60 秒...")
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            report = executor.submit(run_daily_scan, "close").result(timeout=120)
+        for i in range(0, len(report), 4000):
+            await update.message.reply_text(report[i:i+4000])
+    except Exception as e:
+        await update.message.reply_text(f"掃描失敗：{e}")
 # 文字訊息路由
 # ══════════════════════════════════════════════════════
 
@@ -680,6 +692,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("清單", "監控清單", "自選股"): cmd_list,
         # 選股
         ("選股", "掃描", "screen"): cmd_screen,
+        ("掃描全市場", "全市場", "scan"): cmd_scan,
         ("新聞", "今日新聞", "news"): cmd_news,
         # 宏觀
         ("宏觀", "大盤", "市場", "macro"): cmd_macro,
@@ -794,6 +807,8 @@ def run_scheduler(bot_token: str, user_ids: list):
     schedule.every().day.at("15:35").do(lambda: asyncio.run(do_daily_report()))
     schedule.every(15).minutes.do(lambda: asyncio.run(do_alert_check()))
     schedule.every().sunday.at("21:00").do(lambda: asyncio.run(do_weekly_learning()))
+    schedule.every().day.at("08:30").do(lambda: threading.Thread(target=run_open_alert, args=(bot_token, user_ids), daemon=True).start())
+    schedule.every().day.at("15:30").do(lambda: threading.Thread(target=run_close_alert, args=(bot_token, user_ids), daemon=True).start())
 
     logger.info("排程器啟動：15:10更新資料 | 15:35推報告 | 每15分鐘監控 | 週日學習")
     while True:

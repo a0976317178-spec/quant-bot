@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # ── 設定 ─────────────────────────────────────────────────
 MIN_VOLUME_LOTS   = 3000    # 最低成交量（張）
 MIN_SCORE         = 60      # 最低評分
-MAX_RESULTS       = 8       # 最多推送幾支
+MAX_RESULTS       = 50       # 最多推送幾支
 MIN_PRICE         = 10.0    # 過濾低價股（元）
 MAX_PRICE         = 2000.0  # 過濾超高價股（非必要）
 
@@ -275,15 +275,11 @@ def run_daily_scan(mode: str = "close") -> str:
             else f"{s['vol_today']}張"
         )
 
-        lines += [
-            f"{emoji} {s['stock_id']} {s['name']}  {s['score']}分 {grade}",
-            f"   現價 ${s['close']}  量 {vol_display}（{vol_note}）",
-            f"   RSI={s['rsi']}  乖離={s['bias']:+.1f}%  5日={s['ret_5d']:+.1f}%",
-            f"   進場區間：${s['entry_low']}~${s['entry_high']}",
-            f"   停損：${s['stop_loss']}（-5%）　停利：${s['target']}（+10%）",
-            f"   輸入「分析 {s['stock_id']}」看完整報告",
-            f"",
-        ]
+        lines.append(
+            f"{emoji} {s['stock_id']} {s['name']}  {s['score']}分 | "
+            f"${round(s['close'],2)} | {vol_display}({vol_note}) | "
+            f"RSI={s['rsi']} | 5日={s['ret_5d']:+.1f}%"
+        )
 
     lines += [
         f"━━━━━━━━━━━━━━━",
