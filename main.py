@@ -937,6 +937,10 @@ async def cmd_signal_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 文字訊息路由
 # ══════════════════════════════════════════════════════
 
+
+async def cmd_paper_portfolio(update, context):
+    await update.message.reply_text(get_paper_portfolio(), parse_mode="Markdown")
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         return
