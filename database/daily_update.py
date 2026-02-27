@@ -6,13 +6,35 @@ database/daily_update.py - 每日自動更新所有資料
 3. 月營收（每月10號更新）
 4. 宏觀指標（VIX）
 5. 因子快取重新計算
+
+修復：
+  - yfinance MultiIndex DataFrame 相容性問題（Series.strftime 錯誤）
+  - 使用 ticker.history() 取代 yf.download() 避免 MultiIndex
 """
 import logging
 import time
+import pandas as pd
 from datetime import datetime, timedelta
 from database.db_manager import get_conn, query_df, safe_request
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_float(val) -> float:
+    """安全地把 pandas Series 或純量轉成 float"""
+    if hasattr(val, "iloc"):
+        val = val.iloc[0]
+    try:
+        return float(val)
+    except Exception:
+        return 0.0
+
+
+def _safe_date_str(val) -> str:
+    """安全地把 pandas Timestamp / Series 轉成日期字串"""
+    if hasattr(val, "iloc"):
+        val = val.iloc[0]
+    return pd.Timestamp(val).strftime("%Y-%m-%d")
 
 
 # ══════════════════════════════════════════
@@ -22,20 +44,18 @@ logger = logging.getLogger(__name__)
 def update_today_prices(stock_ids: list = None) -> str:
     """
     更新今日收盤價
-    預設只更新監控清單，速度快（幾分鐘內完成）
+    ✅ 修復：改用 ticker.history() 避免 MultiIndex 問題
     """
     import yfinance as yf
 
     if stock_ids is None:
-        # 優先更新監控清單，其次抓資料庫所有股票
         try:
             from memory.daily_learning import load_watchlist
             stock_ids = load_watchlist()
-        except:
+        except Exception:
             stock_ids = []
 
         if not stock_ids:
-            # 若監控清單為空，更新所有股票（耗時較長）
             with get_conn() as conn:
                 rows = conn.execute(
                     "SELECT stock_id FROM stocks ORDER BY stock_id"
@@ -45,34 +65,34 @@ def update_today_prices(stock_ids: list = None) -> str:
     if not stock_ids:
         return "❌ 股票清單為空，請先執行更新清單"
 
-    today = datetime.now().strftime("%Y-%m-%d")
     yesterday = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
-    success = 0
-    fail = 0
+    today     = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    success   = 0
+    fail      = 0
 
     for stock_id in stock_ids:
+        saved = False
         for suffix in [".TW", ".TWO"]:
             try:
-                df = yf.download(
-                    f"{stock_id}{suffix}",
-                    start=yesterday,
-                    end=today,
-                    progress=False,
-                    auto_adjust=True,
-                )
-                if df.empty:
+                # ✅ 修復核心：改用 ticker.history()，回傳的是單層 DataFrame
+                ticker = yf.Ticker(f"{stock_id}{suffix}")
+                df = ticker.history(start=yesterday, end=today, auto_adjust=True)
+
+                if df is None or df.empty:
                     continue
+
                 df = df.reset_index()
+
                 with get_conn() as conn:
                     for _, row in df.iterrows():
-                        date_str = row["Date"].strftime("%Y-%m-%d")
-                        try:
-                            close = float(row["Close"].iloc[0] if hasattr(row["Close"], "iloc") else row["Close"])
-                            open_ = float(row["Open"].iloc[0] if hasattr(row["Open"], "iloc") else row["Open"])
-                            high  = float(row["High"].iloc[0] if hasattr(row["High"], "iloc") else row["High"])
-                            low   = float(row["Low"].iloc[0]  if hasattr(row["Low"],  "iloc") else row["Low"])
-                            vol   = float(row["Volume"].iloc[0] if hasattr(row["Volume"], "iloc") else row["Volume"])
-                        except:
+                        # ✅ 修復：用 _safe_date_str 避免 Series.strftime 錯誤
+                        date_str = _safe_date_str(row["Date"])
+                        close  = _safe_float(row.get("Close",  0))
+                        open_  = _safe_float(row.get("Open",   0))
+                        high   = _safe_float(row.get("High",   0))
+                        low    = _safe_float(row.get("Low",    0))
+                        vol    = _safe_float(row.get("Volume", 0))
+                        if close <= 0:
                             continue
                         conn.execute("""
                             INSERT INTO daily_price
@@ -83,14 +103,17 @@ def update_today_prices(stock_ids: list = None) -> str:
                                 low=excluded.low, close=excluded.close,
                                 volume=excluded.volume, adj_close=excluded.adj_close
                         """, (stock_id, date_str, open_, high, low, close, vol, close))
+
                 success += 1
+                saved = True
                 break
             except Exception as e:
                 logger.debug(f"{stock_id}{suffix} 更新失敗: {e}")
                 continue
-        else:
+
+        if not saved:
             fail += 1
-        time.sleep(0.3)  # 避免被封
+        time.sleep(0.3)
 
     return f"✅ 股價更新完成：{success} 支成功，{fail} 支失敗"
 
@@ -103,7 +126,6 @@ def update_today_institutional() -> str:
     """更新今日三大法人資料"""
     today = datetime.now()
 
-    # 週末不更新
     if today.weekday() >= 5:
         return "📅 今日為假日，跳過三大法人更新"
 
@@ -133,8 +155,10 @@ def update_today_institutional() -> str:
                 continue
 
             def p(v):
-                try: return int(str(v).replace(",", "").strip())
-                except: return 0
+                try:
+                    return int(str(v).replace(",", "").strip())
+                except Exception:
+                    return 0
 
             foreign_net = p(row[4])
             trust_net   = p(row[10])
@@ -168,23 +192,17 @@ def update_today_institutional() -> str:
 # ══════════════════════════════════════════
 
 def update_monthly_revenue() -> str:
-    """
-    爬取月營收資料（公開資訊觀測站）
-    每月10號後更新上個月的資料
-    """
+    """爬取月營收資料（公開資訊觀測站）"""
     today = datetime.now()
 
-    # 只在每月 10~20 號更新（10號前資料未齊全）
     if today.day < 10:
         return "📅 月營收：每月10號後才更新，本月尚未到期"
 
-    # 計算上個月
     if today.month == 1:
         year, month = today.year - 1, 12
     else:
         year, month = today.year, today.month - 1
 
-    # 確認是否已有資料
     with get_conn() as conn:
         existing = conn.execute(
             "SELECT COUNT(*) as cnt FROM monthly_revenue WHERE year=? AND month=?",
@@ -193,20 +211,18 @@ def update_monthly_revenue() -> str:
         if existing and existing["cnt"] > 100:
             return f"✅ 月營收：{year}/{month:02d} 資料已存在（{existing['cnt']} 筆），跳過"
 
-    # 爬取公開資訊觀測站
     url = "https://mops.twse.com.tw/nas/t21/sii/t21sc03_{year}_{month}_0.csv".format(
-        year=year - 1911,  # 民國年
+        year=year - 1911,
         month=month
     )
 
     try:
         import requests
         resp = requests.get(url, timeout=30,
-                           headers={"User-Agent": "Mozilla/5.0"})
+                            headers={"User-Agent": "Mozilla/5.0"})
         resp.encoding = "big5"
 
         import io
-        import pandas as pd
         df = pd.read_csv(io.StringIO(resp.text), header=0)
 
         if df.empty:
@@ -219,23 +235,20 @@ def update_monthly_revenue() -> str:
                     stock_id = str(row.iloc[0]).strip()
                     if not stock_id[:4].isdigit():
                         continue
-
-                    revenue = float(str(row.iloc[4]).replace(",", "") or 0)
+                    revenue      = float(str(row.iloc[4]).replace(",", "") or 0)
                     last_revenue = float(str(row.iloc[7]).replace(",", "") or 0)
-                    yoy = float(str(row.iloc[10]).replace(",", "") or 0)
-                    mom = float(str(row.iloc[9]).replace(",", "") or 0)
-
+                    yoy          = float(str(row.iloc[10]).replace(",", "") or 0)
+                    mom          = float(str(row.iloc[9]).replace(",", "") or 0)
                     conn.execute("""
                         INSERT INTO monthly_revenue
                             (stock_id, year, month, revenue, last_revenue, yoy, mom)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(stock_id, year, month) DO UPDATE SET
                             revenue=excluded.revenue,
-                            yoy=excluded.yoy,
-                            mom=excluded.mom
+                            yoy=excluded.yoy, mom=excluded.mom
                     """, (stock_id, year, month, revenue, last_revenue, yoy, mom))
                     count += 1
-                except:
+                except Exception:
                     continue
 
         return f"✅ 月營收更新完成：{year}/{month:02d} 共 {count} 筆"
@@ -249,22 +262,35 @@ def update_monthly_revenue() -> str:
 # ══════════════════════════════════════════
 
 def update_macro() -> str:
-    """更新 VIX 等宏觀指標"""
+    """
+    更新 VIX 等宏觀指標
+    ✅ 修復：改用 ticker.history() 避免 MultiIndex / Series.strftime 錯誤
+    """
     try:
         import yfinance as yf
-        end = datetime.now()
-        start = end - timedelta(days=7)
+        end   = datetime.now() + timedelta(days=1)
+        start = datetime.now() - timedelta(days=7)
 
-        vix_df = yf.download("^VIX", start=start, end=end, progress=False)
-        if vix_df.empty:
+        # ✅ 修復核心：改用 Ticker.history() 而不是 yf.download()
+        vix_ticker = yf.Ticker("^VIX")
+        vix_df = vix_ticker.history(
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            auto_adjust=True
+        )
+
+        if vix_df is None or vix_df.empty:
             return "⚠️ 宏觀指標：VIX 資料取得失敗"
 
         vix_df = vix_df.reset_index()
         count = 0
         with get_conn() as conn:
             for _, row in vix_df.iterrows():
-                date_str = row["Date"].strftime("%Y-%m-%d")
-                close = float(row["Close"].iloc[0] if hasattr(row["Close"], "iloc") else row["Close"])
+                # ✅ 修復：用 _safe_date_str 避免 Series.strftime 錯誤
+                date_str = _safe_date_str(row["Date"])
+                close    = _safe_float(row.get("Close", 0))
+                if close <= 0:
+                    continue
                 conn.execute("""
                     INSERT INTO macro_daily (date, vix)
                     VALUES (?, ?)
@@ -283,15 +309,12 @@ def update_macro() -> str:
 # ══════════════════════════════════════════
 
 def update_factor_cache(stock_ids: list = None) -> str:
-    """
-    重新計算並快取技術指標因子
-    供 ML 模型使用
-    """
+    """重新計算並快取技術指標因子"""
     if stock_ids is None:
         try:
             from memory.daily_learning import load_watchlist
             stock_ids = load_watchlist()
-        except:
+        except Exception:
             stock_ids = []
 
     if not stock_ids:
@@ -312,29 +335,24 @@ def update_factor_cache(stock_ids: list = None) -> str:
             if df.empty or len(df) < 20:
                 continue
 
-            import pandas as pd
             import numpy as np
             df = df.sort_values("date").reset_index(drop=True)
-            closes = df["close"].astype(float)
+            closes  = df["close"].astype(float)
             volumes = df["volume"].astype(float)
 
-            # 計算常用因子
-            ma20 = closes.rolling(20).mean().iloc[-1]
-            ma60 = closes.rolling(60).mean().iloc[-1] if len(df) >= 60 else ma20
+            ma20    = closes.rolling(20).mean().iloc[-1]
+            ma60    = closes.rolling(60).mean().iloc[-1] if len(df) >= 60 else ma20
             vol_ma20 = volumes.rolling(20).mean().iloc[-1]
             current = closes.iloc[-1]
 
-            # RSI
             delta = closes.diff()
-            gain = delta.clip(lower=0).rolling(14).mean().iloc[-1]
-            loss = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
-            rsi = 100 - (100 / (1 + gain / loss)) if loss > 0 else 50
+            gain  = delta.clip(lower=0).rolling(14).mean().iloc[-1]
+            loss  = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
+            rsi   = 100 - (100 / (1 + gain / loss)) if loss > 0 else 50
 
-            # 報酬率
-            ret_5d = (current / closes.iloc[-6] - 1) if len(df) >= 6 else 0
+            ret_5d  = (current / closes.iloc[-6]  - 1) if len(df) >= 6  else 0
             ret_20d = (current / closes.iloc[-21] - 1) if len(df) >= 21 else 0
 
-            # 寫入因子快取
             with get_conn() as conn:
                 conn.execute("""
                     INSERT INTO factor_cache
@@ -377,28 +395,23 @@ async def run_daily_update() -> str:
     results.append(f"🔄 每日資料更新 {start_time.strftime('%Y/%m/%d %H:%M')}")
     results.append("━━━━━━━━━━━━━━━━━")
 
-    # 1. 今日股價
     logger.info("更新今日股價...")
     results.append(update_today_prices())
 
-    # 2. 三大法人
     logger.info("更新三大法人...")
     results.append(update_today_institutional())
 
-    # 3. 月營收（每月自動判斷）
     logger.info("更新月營收...")
     results.append(update_monthly_revenue())
 
-    # 4. 宏觀指標
     logger.info("更新宏觀指標...")
     results.append(update_macro())
 
-    # 5. 因子快取
     logger.info("更新因子快取...")
     results.append(update_factor_cache())
 
     elapsed = (datetime.now() - start_time).seconds
-    results.append(f"━━━━━━━━━━━━━━━━━")
-    results.append(f"⏱ 總耗時：{elapsed} 秒")
+    results.append("━━━━━━━━━━━━━━━━━")
+    results.append(f"⏱️ 總耗時：{elapsed} 秒")
 
     return "\n".join(results)
