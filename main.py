@@ -51,6 +51,12 @@ from memory.ai_self_learning import get_self_learning_summary, run_daily_self_le
 from alert.daily_alert import run_daily_scan, run_open_alert, run_close_alert
 # ✅ 修補1：匯入假日判斷模組
 from tw_market_calendar import is_trading_day, is_market_open, get_holiday_name
+# ✅ 新功能：AI 信號追蹤器
+from ai_signal_tracker import (
+    run_daily_signal_scan, get_active_signals,
+    get_signal_performance, get_signal_history,
+    run_signal_self_learning, generate_buy_signals
+)
 
 load_dotenv()
 logging.basicConfig(
@@ -167,6 +173,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "┣ `規則` — 查看所有規則\n"
         "┣ `刪除規則 1` — 刪除指定規則\n"
         "┗ `學習記錄` — 查看 AI 自學習日誌\n\n"
+
+        "🤖 *AI 自動信號*\n"
+        "┣ `信號清單` — 查看目前 AI 主動買入信號\n"
+        "┣ `信號績效` — AI 信號勝率統計\n"
+        "┣ `信號記錄` — 歷史信號記錄\n"
+        "┗ `立即掃信號` — 手動觸發信號掃描\n\n"
 
         "🗄️ *資料庫*\n"
         "┣ `/db`  `資料庫` — 查看資料庫狀態\n"
@@ -848,6 +860,40 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ 掃描失敗：{e}")
 
 
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看目前 AI 主動信號清單"""
+    if not is_authorized(update.effective_user.id):
+        return
+    await update.message.reply_text(get_active_signals(), parse_mode="Markdown")
+
+
+async def cmd_signal_perf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看 AI 信號績效統計"""
+    if not is_authorized(update.effective_user.id):
+        return
+    await update.message.reply_text(get_signal_performance(), parse_mode="Markdown")
+
+
+async def cmd_signal_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看歷史信號記錄"""
+    if not is_authorized(update.effective_user.id):
+        return
+    await update.message.reply_text(get_signal_history(), parse_mode="Markdown")
+
+
+async def cmd_signal_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """手動觸發 AI 信號掃描"""
+    if not is_authorized(update.effective_user.id):
+        return
+    await update.message.reply_text("🤖 AI 信號掃描中，請稍候...")
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            report = executor.submit(run_daily_signal_scan, claude_client).result(timeout=120)
+        await update.message.reply_text(report, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ 掃描失敗：{e}")
+
+
 # ══════════════════════════════════════════════════════
 # 文字訊息路由
 # ══════════════════════════════════════════════════════
@@ -860,6 +906,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kw = parts[0] if parts else ""
 
     routes = {
+        # 信號
+        ("信號清單", "ai信號", "signals"): cmd_signals,
+        ("信號績效", "signal績效"): cmd_signal_perf,
+        ("信號記錄", "信號歷史"): cmd_signal_history,
+        ("立即掃信號", "掃信號", "signal"): cmd_signal_scan,
         # 股價
         ("股價", "查股價", "現價", "price"): cmd_price,
         # 分析
@@ -989,18 +1040,46 @@ def run_scheduler(bot_token: str, user_ids: list):
                 except:
                     pass
 
+    async def do_daily_signal_scan():
+        """✅ 新功能：每日收盤後自動 AI 信號掃描 + 評估"""
+        if not is_trading_day():
+            return
+        from telegram import Bot
+        bot = Bot(token=bot_token)
+        try:
+            report = run_daily_signal_scan(claude_client)
+            for uid in user_ids:
+                try:
+                    await bot.send_message(chat_id=uid, text=report, parse_mode="Markdown")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"每日信號掃描失敗: {e}")
+
     async def do_weekly_learning():
         from telegram import Bot
         bot = Bot(token=bot_token)
+        # 交易週報
         report = weekly_self_learning(claude_client)
         for uid in user_ids:
             try:
                 await bot.send_message(chat_id=uid, text=report)
-            except:
+            except Exception:
                 pass
+        # ✅ 新增：信號系統自學習（自動調整門檻）
+        try:
+            signal_report = run_signal_self_learning(claude_client)
+            for uid in user_ids:
+                try:
+                    await bot.send_message(chat_id=uid, text=signal_report, parse_mode="Markdown")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"信號自學習失敗: {e}")
 
     schedule.every().day.at("15:10").do(lambda: asyncio.run(do_daily_update()))
     schedule.every().day.at("15:35").do(lambda: asyncio.run(do_daily_report()))
+    schedule.every().day.at("15:40").do(lambda: asyncio.run(do_daily_signal_scan()))  # ✅ 新增
     schedule.every(15).minutes.do(lambda: asyncio.run(do_alert_check()))
     schedule.every().sunday.at("21:00").do(lambda: asyncio.run(do_weekly_learning()))
     schedule.every().day.at("08:30").do(
@@ -1010,7 +1089,7 @@ def run_scheduler(bot_token: str, user_ids: list):
         lambda: threading.Thread(target=run_close_alert, args=(bot_token, user_ids), daemon=True).start()
     )
 
-    logger.info("排程器啟動：15:10更新資料 | 15:35推報告 | 每15分鐘盤中監控 | 週日自我學習")
+    logger.info("排程器啟動：15:10更新 | 15:35報告 | 15:40信號掃描 | 每15分鐘監控 | 週日自學習")
     while True:
         schedule.run_pending()
         time.sleep(60)
@@ -1054,7 +1133,7 @@ def main():
         ("stocks",   cmd_stocks),  ("crawl",    cmd_crawl),
         ("update",   cmd_update),  ("report",   cmd_report),
         ("score",    cmd_score),   ("news",     cmd_news),
-        ("scan",     cmd_scan),
+        ("scan",     cmd_scan),    ("signals",  cmd_signals),
     ]
     for name, handler in cmds:
         app.add_handler(CommandHandler(name, handler))
