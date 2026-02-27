@@ -51,6 +51,20 @@ from memory.ai_self_learning import get_self_learning_summary, run_daily_self_le
 from alert.daily_alert import run_daily_scan, run_open_alert, run_close_alert
 # ✅ 修補1：匯入假日判斷模組
 from tw_market_calendar import is_trading_day, is_market_open, get_holiday_name
+# ✅ 新功能：技能載入引擎
+from skill_hunter import (
+    learn_skill_from_request, install_skill_from_url,
+    list_all_skills, uninstall_skill, set_skillsmp_key
+)
+from skill_loader import (
+    build_skills_prompt, list_skills, add_custom_skill,
+    get_skill_detail, run_skill_self_learning
+)
+# ✅ 新功能：模擬交易引擎
+from paper_trading import (
+    run_daily_paper_trading, get_paper_portfolio,
+    get_paper_report, get_paper_config_summary, update_paper_config
+)
 # ✅ 新功能：AI 信號追蹤器
 from ai_signal_tracker import (
     run_daily_signal_scan, get_active_signals,
@@ -93,15 +107,24 @@ async def ask_claude(user_id: int, message: str, use_smart: bool = False) -> str
     except Exception:
         pass
 
+    # ✅ 新功能：載入技能庫知識
+    skills_prompt = ""
+    try:
+        skills_prompt = build_skills_prompt(max_skills=4)
+    except Exception:
+        pass
+
     system = (
         "你是專業台股量化交易AI助理「量化師」。\n"
         "所有回覆必須使用繁體中文，格式要清晰易讀，適當使用emoji。\n"
         "專長：技術分析、籌碼分析、基本面、量化選股、風險控管。\n"
         f"近期市場觀察：{recent}\n"
         f"{win_rate_context}\n"
+        f"{skills_prompt}\n"
         f"{rules}\n"
         "分析時依量價、籌碼、基本面、宏觀四維度，並說明風險。\n"
-        "回覆要有重點、有結論、有操作建議，避免空泛說明。"
+        "回覆要有重點、有結論、有操作建議，避免空泛說明。\n"
+        "使用技能庫的評分規則時，請在回覆中說明使用了哪個技能。"
     )
     history = load_history(user_id)
     history.append({"role": "user", "content": message})
@@ -179,6 +202,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "┣ `信號績效` — AI 信號勝率統計\n"
         "┣ `信號記錄` — 歷史信號記錄\n"
         "┗ `立即掃信號` — 手動觸發信號掃描\n\n"
+
+        "🎮 *模擬交易（先練再實盤）*\n"
+        "┣ `模擬持倉` — AI 目前模擬倉位\n"
+        "┣ `模擬績效` — 模擬勝率與損益\n"
+        "┗ `模擬設定` — 查看/修改模擬參數\n\n"
+
+        "📚 *技能庫（AI 自動學習）*\n"
+        "┣ `技能庫` — 查看所有策略技能\n"
+        "┣ `技能 momentum` — 查看技能規則\n"
+        "┗ `新增技能 名稱 內容` — 新增自定義技能\n\n"
+
+        "🌐 *AI 自動搜尋新技能*\n"
+        "┣ `幫我學習 [需求]` — AI 自動搜尋安裝（例：幫我學習下載影片）\n"
+        "┣ `安裝技能 [GitHub URL]` — 直接安裝 GitHub 技能\n"
+        "┣ `移除技能 名稱` — 移除已安裝技能\n"
+        "┗ `設定SkillsMP金鑰 sk_live_xxx` — 啟用 AI 語意搜尋\n\n"
 
         "🗄️ *資料庫*\n"
         "┣ `/db`  `資料庫` — 查看資料庫狀態\n"
@@ -906,6 +945,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kw = parts[0] if parts else ""
 
     routes = {
+        # 模擬交易
+        ("模擬持倉", "模擬倉位", "paper"): cmd_paper_portfolio,
+        ("模擬績效", "模擬報告"): cmd_paper_report,
+        ("模擬設定", "paper設定"): cmd_paper_config,
+        ("執行模擬", "模擬交易"): cmd_paper_run,
+        # 技能獵人（AI 自動搜尋學習）
+        ("幫我學習", "學習技能", "搜尋技能", "learn"): cmd_learn_skill,
+        ("安裝技能", "install技能"): cmd_install_skill_url,
+        ("移除技能", "刪除技能"): cmd_uninstall_skill,
+        ("設定SkillsMP金鑰", "設定skillsmp", "skillsmpkey"): cmd_set_skillsmp_key,
+        # 技能庫
+        ("技能庫", "技能列表", "所有技能", "skills"): cmd_all_skills,
+        ("技能", "skill查看"): cmd_skill_detail,
+        ("新增技能",): cmd_add_skill,
         # 信號
         ("信號清單", "ai信號", "signals"): cmd_signals,
         ("信號績效", "signal績效"): cmd_signal_perf,
@@ -1040,6 +1093,22 @@ def run_scheduler(bot_token: str, user_ids: list):
                 except:
                     pass
 
+    async def do_daily_paper_trading_task():
+        """✅ 模擬交易：每日自動評估持倉 + 建立新倉"""
+        if not is_trading_day():
+            return
+        from telegram import Bot
+        bot = Bot(token=bot_token)
+        try:
+            report = run_daily_paper_trading(claude_client)
+            for uid in user_ids:
+                try:
+                    await bot.send_message(chat_id=uid, text=report, parse_mode="Markdown")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"模擬交易執行失敗: {e}")
+
     async def do_daily_signal_scan():
         """✅ 新功能：每日收盤後自動 AI 信號掃描 + 評估"""
         if not is_trading_day():
@@ -1076,12 +1145,23 @@ def run_scheduler(bot_token: str, user_ids: list):
                     pass
         except Exception as e:
             logger.warning(f"信號自學習失敗: {e}")
+        # ✅ 技能自學習：評估技能效果，讓AI越來越聰明
+        try:
+            skill_report = run_skill_self_learning(claude_client)
+            for uid in user_ids:
+                try:
+                    await bot.send_message(chat_id=uid, text=skill_report, parse_mode="Markdown")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"技能自學習失敗: {e}")
 
     schedule.every().day.at("15:10").do(lambda: asyncio.run(do_daily_update()))
     schedule.every().day.at("15:35").do(lambda: asyncio.run(do_daily_report()))
     schedule.every().day.at("15:40").do(lambda: asyncio.run(do_daily_signal_scan()))  # ✅ 新增
+    schedule.every().day.at("15:45").do(lambda: asyncio.run(do_daily_paper_trading_task()))  # ✅ 模擬交易
     schedule.every(15).minutes.do(lambda: asyncio.run(do_alert_check()))
-    schedule.every().sunday.at("21:00").do(lambda: asyncio.run(do_weekly_learning()))
+    schedule.every().day.at("21:00").do(lambda: asyncio.run(do_weekly_learning()))  # ✅ 改為每天推送學習報告
     schedule.every().day.at("08:30").do(
         lambda: threading.Thread(target=run_open_alert, args=(bot_token, user_ids), daemon=True).start()
     )
@@ -1147,3 +1227,173 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ══════════════════════════════════════════════════════
+# 模擬交易指令
+# ══════════════════════════════════════════════════════
+
+async def cmd_paper_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看模擬持倉"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(get_paper_portfolio(), parse_mode="Markdown")
+
+async def cmd_paper_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看模擬績效報告"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(get_paper_report(), parse_mode="Markdown")
+
+async def cmd_paper_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看/修改模擬設定"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["模擬設定", "paper設定"]]
+    if len(args) < 2:
+        await update.message.reply_text(get_paper_config_summary(), parse_mode="Markdown")
+        return
+    try:
+        val = float(args[1]) if '.' in args[1] else int(args[1])
+        await update.message.reply_text(update_paper_config(args[0], val))
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ 設定失敗：{e}")
+
+async def cmd_paper_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """手動執行一次模擬交易"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("🎮 執行模擬交易中...")
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            report = executor.submit(run_daily_paper_trading, claude_client).result(timeout=120)
+        await update.message.reply_text(report, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ 失敗：{e}")
+
+# ══════════════════════════════════════════════════════
+# 技能庫指令
+# ══════════════════════════════════════════════════════
+
+async def cmd_skills_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看技能庫"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(list_skills(), parse_mode="Markdown")
+
+async def cmd_skill_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看技能詳細內容"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["技能", "skill查看"]]
+    if not args:
+        await update.message.reply_text("📌 請輸入技能名稱\n範例：`技能 momentum`", parse_mode="Markdown")
+        return
+    await update.message.reply_text(get_skill_detail(args[0]), parse_mode="Markdown")
+
+async def cmd_add_skill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """新增自定義技能"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    parts = text.split(maxsplit=2)
+    args = [p for p in parts if p not in ["新增技能"]]
+    if len(args) < 2:
+        await update.message.reply_text(
+            "📌 *新增技能格式*\n"
+            "`新增技能 技能名稱 策略說明內容`\n\n"
+            "例如：\n`新增技能 breakout 突破策略：股價突破前高+量能放大3倍時進場，停損設在突破點下方2%`",
+            parse_mode="Markdown"
+        )
+        return
+    name = args[0]
+    content = args[1] if len(args) > 1 else ""
+    await update.message.reply_text(
+        add_custom_skill(name, f"用戶自定義技能：{name}", content)
+    )
+
+
+# ══════════════════════════════════════════════════════
+# 技能獵人（Skill Hunter）指令
+# ══════════════════════════════════════════════════════
+
+async def cmd_learn_skill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """AI 自動搜尋並學習新技能"""
+    if not is_authorized(update.effective_user.id): return
+    text  = update.message.text.strip()
+    # 去除觸發詞
+    for kw in ["幫我學習", "學習技能", "搜尋技能", "learn"]:
+        text = text.replace(kw, "").strip()
+    if not text:
+        await update.message.reply_text(
+            "📌 *使用方式：*\n`幫我學習 [你的需求]`\n\n"
+            "💡 *例如：*\n"
+            "• `幫我學習下載 YouTube 影片`\n"
+            "• `幫我學習爬取網頁資料`\n"
+            "• `幫我學習傳送電子郵件`\n"
+            "• `幫我學習 PDF 處理`",
+            parse_mode="Markdown"
+        )
+        return
+    await update.message.reply_text(f"🔍 正在搜尋「{text[:30]}」相關技能，請稍候...")
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            result = executor.submit(
+                learn_skill_from_request, text, claude_client
+            ).result(timeout=60)
+        await update.message.reply_text(result, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ 搜尋失敗：{e}")
+
+
+async def cmd_install_skill_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """直接從 GitHub URL 安裝技能"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    for kw in ["安裝技能", "install技能"]:
+        text = text.replace(kw, "").strip()
+    if not text or "github.com" not in text:
+        await update.message.reply_text(
+            "📌 *使用方式：*\n`安裝技能 [GitHub URL]`\n\n"
+            "💡 *例如：*\n`安裝技能 https://github.com/user/repo`",
+            parse_mode="Markdown"
+        )
+        return
+    url = text.split()[0]
+    await update.message.reply_text(f"📥 正在安裝技能，請稍候...")
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            result = executor.submit(install_skill_from_url, url).result(timeout=30)
+        await update.message.reply_text(result, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ 安裝失敗：{e}")
+
+
+async def cmd_uninstall_skill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """移除已安裝的技能"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    for kw in ["移除技能", "刪除技能"]:
+        text = text.replace(kw, "").strip()
+    if not text:
+        await update.message.reply_text("📌 請輸入要移除的技能名稱\n範例：`移除技能 video_download`", parse_mode="Markdown")
+        return
+    await update.message.reply_text(uninstall_skill(text.split()[0]), parse_mode="Markdown")
+
+
+async def cmd_set_skillsmp_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """設定 SkillsMP API Key"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    for kw in ["設定SkillsMP金鑰", "設定skillsmp", "skillsmpkey"]:
+        text = text.replace(kw, "").strip()
+    if not text or not text.startswith("sk_"):
+        await update.message.reply_text(
+            "📌 *設定 SkillsMP API Key*\n\n"
+            "前往 https://skillsmp.com/docs/api 取得金鑰\n"
+            "格式：`設定SkillsMP金鑰 sk_live_xxxxx`",
+            parse_mode="Markdown"
+        )
+        return
+    await update.message.reply_text(set_skillsmp_key(text.split()[0]), parse_mode="Markdown")
+
+
+async def cmd_all_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """列出所有技能（含 AI 自動學習的）"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(list_all_skills(), parse_mode="Markdown")
