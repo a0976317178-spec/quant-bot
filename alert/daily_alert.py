@@ -606,6 +606,10 @@ def run_daily_scan(mode: str = "close") -> str:
 def run_open_alert(bot_token: str, user_ids: list):
     import asyncio
     from telegram import Bot
+    from tw_market_calendar import is_trading_day, get_holiday_name
+    if not is_trading_day():
+        logger.info(f"📅 今日非交易日（{get_holiday_name() or '週末'}），跳過早盤提醒")
+        return
     async def send():
         bot = Bot(token=bot_token)
         report = run_daily_scan(mode="open")
@@ -620,6 +624,10 @@ def run_open_alert(bot_token: str, user_ids: list):
 def run_close_alert(bot_token: str, user_ids: list):
     import asyncio
     from telegram import Bot
+    from tw_market_calendar import is_trading_day, get_holiday_name
+    if not is_trading_day():
+        logger.info(f"📅 今日非交易日（{get_holiday_name() or '週末'}），跳過收盤提醒")
+        return
     async def send():
         bot = Bot(token=bot_token)
         report = run_daily_scan(mode="close")
