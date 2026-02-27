@@ -1,0 +1,869 @@
+"""
+main.py - 台股量化交易 Bot（完整整合版）
+整合：資料庫分析 / 勝率學習 / 每日自動更新 / 持股追蹤
+"""
+import os
+import logging
+import asyncio
+import threading
+import concurrent.futures
+from datetime import datetime
+from dotenv import load_dotenv
+import anthropic
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler,
+    MessageHandler, ContextTypes, filters
+)
+from config import (
+    TELEGRAM_TOKEN, ALLOWED_USER_IDS,
+    ANTHROPIC_API_KEY, CLAUDE_FAST_MODEL, CLAUDE_SMART_MODEL
+)
+from memory.rules_manager import (
+    add_rule, delete_rule, list_rules,
+    load_history, save_history, clear_history, get_rules_as_prompt
+)
+from memory.daily_learning import (
+    add_to_watchlist, remove_from_watchlist,
+    list_watchlist, get_recent_learnings, daily_learning_task
+)
+from memory.trade_log import (
+    log_entry, log_exit, get_trade_stats, format_trade_history
+)
+from portfolio.tracker import (
+    add_position, remove_position, list_portfolio, check_portfolio_alerts
+)
+from risk.manager import (
+    get_risk_summary, check_market_risk,
+    calc_position_size, update_risk_param
+)
+from database.db_manager import (
+    get_db_stats, format_db_status, init_db
+)
+from database.daily_update import run_daily_update
+from report.daily_report import generate_daily_report, score_stock
+from factors.analyzer import full_analysis, format_analysis_report
+from ml.self_learning import (
+    update_win_rate, get_win_rate_report,
+    get_strategy_advice, weekly_self_learning
+)
+from memory.ai_self_learning import get_self_learning_summary, run_daily_self_learning
+from alert.daily_alert import run_daily_scan, run_open_alert, run_close_alert
+
+load_dotenv()
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def is_authorized(user_id: int) -> bool:
+    if not ALLOWED_USER_IDS:
+        return True
+    return user_id in ALLOWED_USER_IDS
+
+
+async def ask_claude(user_id: int, message: str, use_smart: bool = False) -> str:
+    model = CLAUDE_SMART_MODEL if use_smart else CLAUDE_FAST_MODEL
+    rules = get_rules_as_prompt()
+    recent = get_recent_learnings(days=3)
+    system = (
+        "你是專業台股量化交易AI助理「量化師」。\n"
+        "所有回覆必須使用繁體中文。\n"
+        "專長：技術分析、籌碼分析、基本面、量化選股、風險控管。\n"
+        f"近期市場觀察：{recent}\n"
+        f"{rules}\n"
+        "分析時依量價、籌碼、基本面、宏觀四維度，並說明風險。"
+    )
+    history = load_history(user_id)
+    history.append({"role": "user", "content": message})
+    try:
+        resp = claude_client.messages.create(
+            model=model, max_tokens=1200,
+            system=system, messages=history
+        )
+        reply = resp.content[0].text
+        history.append({"role": "assistant", "content": reply})
+        save_history(user_id, history)
+        return reply
+    except Exception as e:
+        return f"API 錯誤：{e}"
+
+
+# ══════════════════════════════════════════════════════
+# 指令處理器
+# ══════════════════════════════════════════════════════
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    msg = (
+        "🤖 *量化師* — 台股 AI 交易助理\n"
+        "══════════════════════════\n\n"
+        "💬 *對話*\n"
+        "  `/chat` `對話`   問任何投資問題\n"
+        "  `/clear` `清除`  重置對話記憶\n\n"
+        "📊 *行情分析*\n"
+        "  `/price 2330`   `股價 2330`   即時報價\n"
+        "  `/analyze 2330` `分析 2330`   四維度分析\n"
+        "  `/screen`       `選股`        掃描監控清單\n"
+        "  `/macro`        `宏觀`        VIX 大盤指標\n\n"
+        "📋 *自選股*\n"
+        "  `/watch 2330`   `加入 2330`\n"
+        "  `/unwatch 2330` `移除 2330`\n"
+        "  `/list`         `清單`\n\n"
+        "💼 *持股追蹤*\n"
+        "  `買進 2330 1 980`  記錄進場\n"
+        "  `賣出 2330 1020`   平倉結算\n"
+        "  `持股`             查看持倉\n"
+        "  `建倉試算 980`     計算張數\n\n"
+        "🏆 *勝率學習*\n"
+        "  `/winrate`     `勝率`        查看勝率排行\n"
+        "  `/advice 2330` `策略 2330`   AI 策略建議\n"
+        "  `/tradelog`    `交易記錄`    查看歷史\n\n"
+        "🛡️ *風險控管*\n"
+        "  `風控`           查看風控設定\n"
+        "  `風控設定 停損 7`  修改參數\n"
+        "  `市場風險`        檢查大盤\n\n"
+        "📈 *回測*\n"
+        "  `回測 2330 2022`  個股歷史回測\n\n"
+        "🗄️ *資料庫*\n"
+        "  `/db`         `資料庫`    查看狀態\n"
+        "  `/update`     `更新資料`  立即更新所有資料\n"
+        "  `/report`     `每日報告`  今日評分推報\n"
+        "  `/dbinit`     `初始化`    建立資料庫\n"
+        "  `/crawl 2022` `爬取 2022` 下載歷史股價\n\n"
+        "🧠 *學習規則*\n"
+        "  `新增規則 外資連買3天才進場`\n"
+        "  `規則`  查看 | `刪除規則 1`\n\n"
+        "══════════════════════════\n"
+        "💡 直接輸入 4 位數代號查股價\n"
+        "💡 任何問題直接輸入文字對話"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("請輸入問題，例如：/chat 現在台積電值得買嗎？")
+        return
+    await update.message.reply_text("思考中...")
+    reply = await ask_claude(update.effective_user.id, " ".join(context.args))
+    await update.message.reply_text(reply)
+
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(clear_history(update.effective_user.id))
+
+
+async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["股價", "查股價", "price", "/price"]]
+    if not args:
+        await update.message.reply_text("請輸入代號，例如：股價 2330")
+        return
+    stock_id = args[0]
+    await update.message.reply_text(f"查詢 {stock_id} 中...")
+    try:
+        from factors.realtime import get_stock_quote, format_quote_message
+        quote = get_stock_quote(stock_id)
+        if not quote or quote.get("close", 0) == 0:
+            await update.message.reply_text(f"找不到 {stock_id}，請確認代號")
+            return
+        await update.message.reply_text(format_quote_message(quote), parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"查詢失敗：{e}")
+
+
+async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """完整分析：調用資料庫數據 + AI 解讀 + 存入分析日誌"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["分析", "analyze", "/analyze", "研究"]]
+    if not args:
+        await update.message.reply_text("請輸入代號，例如：分析 2330")
+        return
+    stock_id = args[0]
+    await update.message.reply_text(f"分析 {stock_id} 中，調用資料庫數據...")
+
+    def run_analysis():
+        return full_analysis(stock_id)
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        result = executor.submit(run_analysis).result(timeout=60)
+
+    # 格式化基礎報告
+    report = format_analysis_report(result)
+    await update.message.reply_text(report)
+
+    # 讓 AI 做深度解讀
+    ai_prompt = (
+        f"股票 {stock_id} {result['name']} 分析結果：\n"
+        f"綜合評分：{result['total_score']}分\n"
+        f"技術面：{result['tech']['note']}\n"
+        f"籌碼面：{result['chip']['note']}\n"
+        f"基本面：{result['fund']['note']}\n"
+        f"環境面：{result['env']['note']}\n"
+        f"現價：${result['close_price']}\n\n"
+        f"請用2~3句話給出最關鍵的操作建議，重點說明進場時機、風險點。"
+    )
+    ai_comment = await ask_claude(update.effective_user.id, ai_prompt, use_smart=True)
+    await update.message.reply_text(f"AI 解讀：\n{ai_comment}")
+
+
+async def cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("掃描監控清單中...")
+    try:
+        from memory.daily_learning import load_watchlist
+        watchlist = load_watchlist()
+        if not watchlist:
+            await update.message.reply_text("監控清單為空，先用「加入 2330」加入股票")
+            return
+
+        results = []
+        for sid in watchlist:
+            try:
+                r = score_stock(sid)
+                results.append(r)
+            except:
+                pass
+        results.sort(key=lambda x: x["score"], reverse=True)
+
+        lines = ["掃描完成\n"]
+        for r in results:
+            emoji = "🔥" if r["score"] >= 70 else ("✅" if r["score"] >= 55 else "⬇️")
+            lines.append(f"{emoji} {r['stock_id']} {r['name']}　{r['score']}分　{r['grade']}")
+
+        if results:
+            top = results[0]
+            lines.append(f"\n最高分：{top['stock_id']} {top['score']}分")
+            lines.append(f"輸入「分析 {top['stock_id']}」取得完整分析")
+
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"掃描失敗：{e}")
+
+
+async def cmd_macro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("取得宏觀數據中...")
+    try:
+        from factors.macro import get_macro_snapshot
+        data = get_macro_snapshot()
+        msg = (
+            f"宏觀指標快照\n\n"
+            f"VIX 恐慌指數：{data.get('vix', 'N/A')}\n"
+            f"市場信號：{data.get('vix_signal', 'N/A')}\n"
+            f"上漲家數：{data.get('advancing', 'N/A')}\n"
+            f"下跌家數：{data.get('declining', 'N/A')}\n"
+        )
+        interp = await ask_claude(
+            update.effective_user.id,
+            f"VIX={data.get('vix')}，請用2句話解讀市場環境並給操作建議。"
+        )
+        await update.message.reply_text(msg + "\n" + interp)
+    except Exception as e:
+        await update.message.reply_text(f"取得失敗：{e}")
+
+
+async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["加入", "監控", "watch", "/watch"]]
+    if not args:
+        await update.message.reply_text("請輸入代號，例如：加入 2330")
+        return
+    await update.message.reply_text(add_to_watchlist(args[0]))
+
+
+async def cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["移除", "取消監控", "unwatch", "/unwatch"]]
+    if not args:
+        await update.message.reply_text("請輸入代號，例如：移除 2330")
+        return
+    await update.message.reply_text(remove_from_watchlist(args[0]))
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(list_watchlist())
+
+
+async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """買進：記錄進場 + 持股追蹤 + 交易日誌"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["買進", "buy", "進場", "/buy"]]
+    if len(args) < 3:
+        await update.message.reply_text(
+            "格式：買進 <代號> <張數> <進場價>\n"
+            "範例：買進 2330 1 980\n\n"
+            "自訂停損停利：\n"
+            "買進 2330 1 980 停損7 停利15"
+        )
+        return
+    try:
+        stock_id = args[0]
+        shares = int(args[1])
+        entry_price = float(args[2])
+        stop_loss_pct = 0.05
+        target_pct = 0.10
+        reason = ""
+        for p in args[3:]:
+            if p.startswith("停損"):
+                stop_loss_pct = float(p.replace("停損", "")) / 100
+            elif p.startswith("停利"):
+                target_pct = float(p.replace("停利", "")) / 100
+            else:
+                reason += p + " "
+
+        # 取得當下評分
+        score = 0
+        try:
+            r = score_stock(stock_id)
+            score = r["score"]
+        except:
+            pass
+
+        # 記錄到持股追蹤
+        result = add_position(stock_id, entry_price, shares, stop_loss_pct, target_pct)
+
+        # 記錄到交易日誌（DB）
+        log_entry(stock_id, entry_price, shares, reason.strip(), score)
+
+        await update.message.reply_text(result)
+    except Exception as e:
+        await update.message.reply_text(f"格式錯誤：{e}\n範例：買進 2330 1 980")
+
+
+async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """賣出：平倉 + 更新交易日誌 + 觸發 AI 學習"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["賣出", "sell", "出場", "平倉", "/sell"]]
+    if not args:
+        await update.message.reply_text("格式：賣出 <代號> <出場價>\n範例：賣出 2330 1020")
+        return
+    stock_id = args[0]
+    exit_price = float(args[1]) if len(args) > 1 else None
+
+    exit_reason = "手動出場"
+    if len(args) > 2:
+        exit_reason = " ".join(args[2:])
+
+    result = remove_position(stock_id, exit_price)
+    await update.message.reply_text(result)
+
+    if exit_price:
+        log_exit(stock_id, exit_price, exit_reason)
+
+        # 觸發 AI 自動學習
+        def learn():
+            update_win_rate(stock_id)
+        threading.Thread(target=learn, daemon=True).start()
+
+        # 顯示 AI 策略建議
+        advice = get_strategy_advice(stock_id)
+        await update.message.reply_text(f"AI 學習完成\n\n{advice}")
+
+
+async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(list_portfolio())
+
+
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("檢查持股狀態中...")
+    alerts = await check_portfolio_alerts()
+    if alerts:
+        for a in alerts:
+            await update.message.reply_text(a["message"])
+    else:
+        await update.message.reply_text("所有持股正常，未觸及停損或目標價")
+
+
+async def cmd_calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["建倉試算", "試算", "calc", "/calc"]]
+    if not args or not args[0].replace(".", "").isdigit():
+        await update.message.reply_text("格式：建倉試算 <股價>\n範例：建倉試算 980")
+        return
+    price = float(args[0])
+    r = calc_position_size(price)
+    await update.message.reply_text(
+        f"建倉試算（股價 ${price}）\n\n"
+        f"建議張數：{r['suggested_lots']} 張\n"
+        f"投入金額：${r['actual_invest']:,.0f}\n"
+        f"最大虧損：${r['max_loss_amount']:,.0f}\n"
+        f"停損價：${r['stop_loss_price']}\n"
+        f"目標價：${r['take_profit_price']}\n\n"
+        f"以上依據您的風控設定計算"
+    )
+
+
+async def cmd_winrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看勝率排行榜"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(get_win_rate_report())
+
+
+async def cmd_advice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查詢特定股票 AI 策略建議"""
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["策略", "advice", "/advice"]]
+    if not args:
+        await update.message.reply_text("格式：策略 <代號>\n範例：策略 2330")
+        return
+    await update.message.reply_text(get_strategy_advice(args[0]))
+
+
+async def cmd_tradelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看交易記錄"""
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(format_trade_history(limit=10))
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """交易績效統計"""
+    if not is_authorized(update.effective_user.id): return
+    stats = get_trade_stats(days=30)
+    if stats["total"] == 0:
+        await update.message.reply_text(
+            "近30天尚無交易記錄\n\n"
+            "使用「買進 2330 1 980」記錄進場\n"
+            "使用「賣出 2330 1020」記錄出場"
+        )
+        return
+    emoji = "🟢" if stats["win_rate"] >= 50 else "🔴"
+    await update.message.reply_text(
+        f"近30天交易績效\n\n"
+        f"總交易：{stats['total']} 次\n"
+        f"勝率：{emoji} {stats['win_rate']}% ({stats['wins']}勝/{stats['losses']}敗)\n"
+        f"平均獲利：{stats['avg_win']:+.2f}%\n"
+        f"平均虧損：{stats['avg_loss']:+.2f}%\n"
+        f"累計損益：${stats['total_pnl']:+,.0f}"
+    )
+
+
+async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(get_risk_summary())
+
+
+async def cmd_riskset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["風控設定", "/riskset"]]
+    if len(args) < 2:
+        await update.message.reply_text(
+            "格式：風控設定 <參數> <數值>\n\n"
+            "停損 0.05（5%）\n"
+            "停利 0.10（10%）\n"
+            "總資金 1000000\n"
+            "最大持股 5\n"
+            "VIX門檻 30"
+        )
+        return
+    param_map = {
+        "停損": "stop_loss_pct", "停利": "take_profit_pct",
+        "總資金": "total_capital", "最大持股": "max_positions",
+        "VIX門檻": "pause_when_vix_above"
+    }
+    key = param_map.get(args[0], args[0])
+    try:
+        await update.message.reply_text(update_risk_param(key, float(args[1])))
+    except Exception as e:
+        await update.message.reply_text(f"設定失敗：{e}")
+
+
+async def cmd_mktcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("檢查市場風險中...")
+    result = check_market_risk()
+    if result["warnings"]:
+        msg = "\n".join(result["warnings"])
+        msg += "\n\n系統已自動暫停選股" if result["should_pause"] else "\n\n請注意風險"
+    else:
+        msg = "市場風險正常，可正常操作"
+    await update.message.reply_text(msg)
+
+
+async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["回測", "backtest", "/backtest"]]
+    if not args:
+        await update.message.reply_text(
+            "格式：回測 <代號> [起始年] [結束年]\n"
+            "範例：回測 2330\n"
+            "      回測 2330 2022\n"
+            "      回測 2330 2022 2024"
+        )
+        return
+    stock_id = args[0]
+    start_date = f"{args[1]}-01-01" if len(args) >= 2 else None
+    end_date   = f"{args[2]}-12-31" if len(args) >= 3 else None
+    await update.message.reply_text(f"回測 {stock_id} 中，請稍候...")
+
+    def run():
+        from backtest.engine import run_backtest, format_backtest_report
+        result = run_backtest(stock_id=stock_id, start_date=start_date, end_date=end_date)
+        return format_backtest_report(result)
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        report = executor.submit(run).result(timeout=180)
+    await update.message.reply_text(report)
+
+
+async def cmd_teach(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("請輸入規則，例如：/teach 外資連買3天才進場")
+        return
+    await update.message.reply_text(add_rule(" ".join(context.args)))
+
+
+async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text(list_rules())
+
+
+async def cmd_delrule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("格式：/delrule <編號>，例如：/delrule 1")
+        return
+    await update.message.reply_text(delete_rule(int(context.args[0])))
+
+
+async def cmd_learning(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    report = get_self_learning_summary(days=7)
+    await update.message.reply_text(report if report else get_recent_learnings(days=7))
+
+
+async def cmd_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    try:
+        stats = get_db_stats()
+        await update.message.reply_text(format_db_status(stats))
+    except Exception as e:
+        await update.message.reply_text(f"查詢失敗：{e}\n請先執行「初始化」")
+
+
+async def cmd_dbinit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    try:
+        init_db()
+        await update.message.reply_text(
+            "資料庫初始化完成\n\n"
+            "建議執行順序：\n"
+            "1. 更新清單\n"
+            "2. 爬取 2022\n"
+            "3. 更新資料"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"初始化失敗：{e}")
+
+
+async def cmd_stocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("從證交所更新股票清單中...")
+    def run():
+        from database.crawler import fetch_stock_list, save_stock_list
+        stocks = fetch_stock_list()
+        save_stock_list(stocks)
+        return len(stocks)
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            n = executor.submit(run).result(timeout=120)
+        await update.message.reply_text(f"更新完成！共 {n} 支股票")
+    except Exception as e:
+        await update.message.reply_text(f"更新失敗：{e}")
+
+
+async def cmd_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["爬取", "crawl", "/crawl"]]
+    year = int(args[0]) if args and args[0].isdigit() else 2022
+    await update.message.reply_text(
+        f"開始爬取 {year} 年至今的歷史股價\n"
+        f"背景執行中，可繼續使用 Bot\n"
+        f"用「資料庫」查看進度"
+    )
+    def run():
+        from database.crawler import crawl_all_prices, crawl_institutional, crawl_macro
+        from datetime import timedelta
+        crawl_all_prices(start_year=year)
+        start = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+        crawl_institutional(start_date=start)
+        crawl_macro(days=365)
+    threading.Thread(target=run, daemon=True).start()
+
+
+async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("開始更新所有資料，約需 2~5 分鐘...")
+    result = await run_daily_update()
+    await update.message.reply_text(result)
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("生成每日報告中...")
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        report = executor.submit(generate_daily_report).result(timeout=120)
+    await update.message.reply_text(report)
+
+
+async def cmd_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip().split()
+    args = [p for p in text if p not in ["評分", "score", "/score"]]
+    if not args:
+        await update.message.reply_text("格式：評分 <代號>\n範例：評分 2330")
+        return
+    stock_id = args[0]
+    await update.message.reply_text(f"評分 {stock_id} 中...")
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        result = executor.submit(score_stock, stock_id).result(timeout=60)
+    msg = (
+        f"{result['stock_id']} {result['name']} 評分\n\n"
+        f"總分：{result['score']} 分  {result['grade']}\n"
+        f"━━━━━━━━━━━━━━\n"
+    )
+    for d in result["details"]:
+        msg += f"{d}\n"
+    await update.message.reply_text(msg)
+
+
+# ══════════════════════════════════════════════════════
+
+async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("📰 爬取今日台股新聞中，請稍候約30秒...")
+    try:
+        from news.tw_stock_news import run_daily_news_summary
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            report = executor.submit(run_daily_news_summary, claude_client).result(timeout=90)
+        for i in range(0, len(report), 4000):
+            await update.message.reply_text(report[i:i+4000])
+    except Exception as e:
+        await update.message.reply_text(f"新聞取得失敗：{e}")
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    await update.message.reply_text("🔍 全市場掃描中，約需 30~60 秒...")
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            report = executor.submit(run_daily_scan, "close").result(timeout=120)
+        for i in range(0, len(report), 4000):
+            await update.message.reply_text(report[i:i+4000])
+    except Exception as e:
+        await update.message.reply_text(f"掃描失敗：{e}")
+# 文字訊息路由
+# ══════════════════════════════════════════════════════
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id): return
+    text = update.message.text.strip()
+    parts = text.split()
+    kw = parts[0] if parts else ""
+
+    routes = {
+        # 股價
+        ("股價", "查股價", "現價", "price"): cmd_price,
+        # 分析
+        ("分析", "analyze", "研究"): cmd_analyze,
+        # 監控
+        ("加入", "監控", "watch"): cmd_watch,
+        ("移除", "取消監控", "unwatch"): cmd_unwatch,
+        ("清單", "監控清單", "自選股"): cmd_list,
+        # 選股
+        ("選股", "掃描", "screen"): cmd_screen,
+        ("掃描全市場", "全市場", "scan"): cmd_scan,
+        ("新聞", "今日新聞", "news"): cmd_news,
+        # 宏觀
+        ("宏觀", "大盤", "市場", "macro"): cmd_macro,
+        # 持股
+        ("買進", "buy", "進場"): cmd_buy,
+        ("賣出", "sell", "出場", "平倉"): cmd_sell,
+        ("持股", "持股清單", "portfolio", "倉位"): cmd_portfolio,
+        ("檢查", "check", "警報"): cmd_check,
+        ("建倉試算", "試算", "calc"): cmd_calc,
+        # 勝率
+        ("勝率", "winrate"): cmd_winrate,
+        ("策略", "advice"): cmd_advice,
+        ("交易記錄", "tradelog"): cmd_tradelog,
+        ("績效", "stats"): cmd_stats,
+        # 風控
+        ("風控", "risk", "風險設定"): cmd_risk,
+        ("風控設定", "riskset"): cmd_riskset,
+        ("市場風險", "風險檢查", "mktcheck"): cmd_mktcheck,
+        # 回測
+        ("回測", "backtest"): cmd_backtest,
+        # 規則
+        ("新增規則", "記住", "teach"): cmd_teach,
+        ("規則", "規則清單", "rules"): cmd_rules,
+        ("刪除規則", "delrule"): cmd_delrule,
+        ("學習記錄", "learning"): cmd_learning,
+        # 資料庫
+        ("資料庫", "db"): cmd_db,
+        ("初始化",): cmd_dbinit,
+        ("更新清單", "stocks"): cmd_stocks,
+        ("爬取", "crawl"): cmd_crawl,
+        ("更新資料", "立即更新", "update"): cmd_update,
+        ("每日報告", "今日報告", "report"): cmd_report,
+        ("評分", "score"): cmd_score,
+        # 其他
+        ("清除", "clear"): cmd_clear,
+        ("說明", "指令", "幫助", "help", "選單", "start"): cmd_start,
+    }
+
+    for keywords, handler in routes.items():
+        if kw in keywords:
+            await handler(update, context)
+            return
+
+    # 4位數代號直接查股價
+    if text.isdigit() and len(text) == 4:
+        context.args = [text]
+        await cmd_price(update, context)
+        return
+
+    # 預設對話
+    reply = await ask_claude(update.effective_user.id, text)
+    await update.message.reply_text(reply)
+
+
+# ══════════════════════════════════════════════════════
+# 排程器
+# ══════════════════════════════════════════════════════
+
+def run_scheduler(bot_token: str, user_ids: list):
+    import schedule
+    import time
+
+    async def do_daily_update():
+        from telegram import Bot
+        bot = Bot(token=bot_token)
+        result = await run_daily_update()
+        logger.info(f"每日更新完成：{result[:50]}")
+        for uid in user_ids:
+            try:
+                await bot.send_message(chat_id=uid, text=result)
+            except: pass
+
+    async def do_daily_report():
+        from telegram import Bot
+        bot = Bot(token=bot_token)
+        report = generate_daily_report()
+        for uid in user_ids:
+            try:
+                await bot.send_message(chat_id=uid, text=report)
+            except: pass
+
+    async def do_alert_check():
+        from telegram import Bot
+        now = datetime.now()
+        if not (9 <= now.hour < 13 or (now.hour == 13 and now.minute <= 30)):
+            return
+        bot = Bot(token=bot_token)
+        alerts = await check_portfolio_alerts()
+        for a in alerts:
+            for uid in user_ids:
+                try:
+                    await bot.send_message(chat_id=uid, text=a["message"])
+                except: pass
+        risk = check_market_risk()
+        if risk["should_pause"] and risk["warnings"]:
+            msg = "\n".join(risk["warnings"]) + "\n\n系統已自動暫停選股"
+            for uid in user_ids:
+                try:
+                    await bot.send_message(chat_id=uid, text=msg)
+                except: pass
+
+    async def do_weekly_learning():
+        from telegram import Bot
+        bot = Bot(token=bot_token)
+        report = weekly_self_learning(claude_client)
+        for uid in user_ids:
+            try:
+                await bot.send_message(chat_id=uid, text=report)
+            except: pass
+
+    schedule.every().day.at("15:10").do(lambda: asyncio.run(do_daily_update()))
+    schedule.every().day.at("15:35").do(lambda: asyncio.run(do_daily_report()))
+    schedule.every(15).minutes.do(lambda: asyncio.run(do_alert_check()))
+    schedule.every().sunday.at("21:00").do(lambda: asyncio.run(do_weekly_learning()))
+    schedule.every().day.at("08:30").do(lambda: threading.Thread(target=run_open_alert, args=(bot_token, user_ids), daemon=True).start())
+    schedule.every().day.at("15:30").do(lambda: threading.Thread(target=run_close_alert, args=(bot_token, user_ids), daemon=True).start())
+
+    logger.info("排程器啟動：15:10更新資料 | 15:35推報告 | 每15分鐘監控 | 週日學習")
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+
+# ══════════════════════════════════════════════════════
+# 主程式
+# ══════════════════════════════════════════════════════
+
+def main():
+    if not TELEGRAM_TOKEN:
+        raise ValueError("請設定 TELEGRAM_BOT_TOKEN")
+    if not ANTHROPIC_API_KEY:
+        raise ValueError("請設定 ANTHROPIC_API_KEY")
+
+    init_db()
+    threading.Thread(
+        target=run_scheduler,
+        args=(TELEGRAM_TOKEN, ALLOWED_USER_IDS),
+        daemon=True
+    ).start()
+
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    cmds = [
+        ("start",    cmd_start),   ("help",     cmd_start),
+        ("chat",     cmd_chat),    ("clear",    cmd_clear),
+        ("price",    cmd_price),   ("analyze",  cmd_analyze),
+        ("screen",   cmd_screen),  ("macro",    cmd_macro),
+        ("watch",    cmd_watch),   ("unwatch",  cmd_unwatch),
+        ("list",     cmd_list),    ("buy",      cmd_buy),
+        ("sell",     cmd_sell),    ("portfolio",cmd_portfolio),
+        ("check",    cmd_check),   ("calc",     cmd_calc),
+        ("winrate",  cmd_winrate), ("advice",   cmd_advice),
+        ("tradelog", cmd_tradelog),("stats",    cmd_stats),
+        ("risk",     cmd_risk),    ("riskset",  cmd_riskset),
+        ("mktcheck", cmd_mktcheck),("backtest", cmd_backtest),
+        ("teach",    cmd_teach),   ("rules",    cmd_rules),
+        ("delrule",  cmd_delrule), ("learning", cmd_learning),
+        ("db",       cmd_db),      ("dbinit",   cmd_dbinit),
+        ("stocks",   cmd_stocks),  ("crawl",    cmd_crawl),
+        ("update",   cmd_update),  ("report",   cmd_report),
+        ("score",    cmd_score),
+    ]
+    for name, handler in cmds:
+        app.add_handler(CommandHandler(name, handler))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, handle_text
+    ))
+
+    logger.info("量化交易 Bot 已啟動")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
