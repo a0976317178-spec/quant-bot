@@ -45,6 +45,13 @@ async def send_telegram_message(message: str):
 
 def daily_task():
     """每日盤後主任務"""
+    # ── 台股假日判斷：非交易日直接跳過，節省 Token ──
+    from tw_market_calendar import is_trading_day, get_holiday_name
+    if not is_trading_day():
+        reason = get_holiday_name() or "週末"
+        logger.info(f"📅 今日非台股交易日（{reason}），跳過執行")
+        return
+
     logger.info("🚀 開始執行每日盤後任務...")
     start_time = datetime.now()
 
